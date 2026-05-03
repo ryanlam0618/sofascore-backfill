@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Fetch player season statistics from SofaScore.
+
+Uses two API calls per player:
+  1. GET /unique-tournament/{ut_id}/season/{season_id}/players?order_by={stat}&limit=50
+     → Returns ranked player list (playerId, name, team) — NO actual stat values
+  2. GET /player/{player_id}/statistics
+     → Returns full stats for that player (goals, assists, xG, apps, etc.)
+
+方案 A: For goals-ordered list, we fetch actual goal counts from /player/{id}/statistics.
+For other stat types, we use order_by rank as proxy (API provides ranking but not values).
+
+Resume-safe with sqlite + state JSON.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import sqlite3
+import time
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+API_BASE = "https://www.sofascore.com/api/v1"
+
+TOURNAMENT_IDS = {
+    "premier-league": 1, "championship": 2, "laliga": 8, "la-liga": 8,
+    "serie-a": 23, "bundesliga": 9, "ligue-1": 4,
+    "uefa-champions-league": 7, "uefa-europa-league": 459,
+    "j1-league": 94, "k-league-1": 245, "a-league": 314,
+}
+
+# category_id -> uniqueTournament_id mapping (confirmed from API)
+CAT_TO_UT = {
+    1: 17,   2: 18,   3: 24,   8: 8,    23: 23,  9: 9,    4: 34,
+    7: 7,    459: 459, 94: 94,  245: 245, 314: 314,
+}
+
+# Stats supported by order_by parameter
+STAT_TYPES = [
+    "goals", "assists", "xg", "xa", "minutes",
+    "appearances", "yellowCards", "redCards",
+    "goalsByPenalties", "shotsOnTarget",
+]
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def ensure_tables(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS player_stats_fetch_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          category_id INTEGER,
+          ut_id INTEGER,
+          season_id INTEGER,
+          stat_type TEXT,
+          fetched_at TEXT,
+          status_code INTEGER,
+          player_count INTEGER,
+          error TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS player_season_stats (
+          category_id INTEGER,
+          ut_id INTEGER,
+          season_id INTEGER,
+          stat_type TEXT,
+          rank INTEGER,
+          player_id INTEGER,
+          player_name TEXT,
+          player_position TEXT,
+          team_id INTEGER,
+          team_name TEXT,
+          goals INTEGER DEFAULT 0,
+          assists INTEGER DEFAULT 0,
+          appearances INTEGER DEFAULT 0,
+          minutes_played INTEGER DEFAULT 0,
+          xg REAL DEFAULT 0,
+          xa REAL DEFAULT 0,
+          yellow_cards INTEGER DEFAULT 0,
+          red_cards INTEGER DEFAULT 0,
+          fetched_at TEXT,
+          UNIQUE(category_id, season_id, stat_type, player_id)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ps ON player_season_stats(category_id, season_id, stat_type)"
+    )
+    conn.commit()
+
+
+def load_state(path):
+    if not path.exists():
+        return {
+            "started_at": now_iso(), "updated_at": now_iso(),
+            "processed": 0, "ok": 0, "not_found": 0, "errors": 0,
+            "stat_rows": 0, "last_category_id": None, "total_targets": 0,
+        }
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_state(path, state):
+    state["updated_at"] = now_iso()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def to_int(v, default=0):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return default
+
+
+def to_float(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def api_get(path):
+    url = f"{API_BASE}/{path.lstrip('/')}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    resp = urllib.request.urlopen(req, timeout=15)
+    return json.loads(resp.read())
+
+
+def get_season_id(ut_id):
+    try:
+        j = api_get(f"unique-tournament/{ut_id}/seasons")
+        seasons = j.get("seasons", [])
+        if seasons:
+            return seasons[0]["id"]
+    except Exception:
+        pass
+    return 0
+
+
+def fetch_player_stats_for_season(player_id, target_season_id, target_ut_id):
+    """Fetch /player/{id}/statistics, return stats for the target season+UT."""
+    try:
+        j = api_get(f"player/{player_id}/statistics")
+        seasons = j.get("seasons", [])
+        # Find the matching season for target tournament
+        for s in seasons:
+            ut = s.get("uniqueTournament", {})
+            stats = s.get("statistics", {})
+            ut_id_val = to_int(ut.get("id") if isinstance(ut, dict) else ut)
+            season_id_val = to_int(s.get("season", {}).get("id") if isinstance(s.get("season"), dict) else s.get("season", {}).get("id"))
+            
+            # Match by ut_id first, then season_id
+            if ut_id_val == target_ut_id or ut_id_val == 0:
+                # Check if this is the target season
+                if target_season_id and season_id_val and season_id_val != target_season_id:
+                    # Season mismatch - try to find current season
+                    continue
+                return {
+                    "goals": to_int(stats.get("goals")),
+                    "assists": to_int(stats.get("assists")),
+                    "appearances": to_int(stats.get("appearances")),
+                    "minutes_played": to_int(stats.get("minutesPlayed")),
+                    "xg": to_float(stats.get("expectedGoals")),
+                    "xa": to_float(stats.get("expectedAssists")),
+                    "yellow_cards": to_int(stats.get("yellowCards")),
+                    "red_cards": to_int(stats.get("redCards")),
+                }
+        
+        # Fallback: try to match by season id only (handles UT id mismatch)
+        for s in seasons:
+            stats = s.get("statistics", {})
+            season_id_val = to_int(s.get("season", {}).get("id") if isinstance(s.get("season"), dict) else 0)
+            if target_season_id and season_id_val == target_season_id:
+                return {
+                    "goals": to_int(stats.get("goals")),
+                    "assists": to_int(stats.get("assists")),
+                    "appearances": to_int(stats.get("appearances")),
+                    "minutes_played": to_int(stats.get("minutesPlayed")),
+                    "xg": to_float(stats.get("expectedGoals")),
+                    "xa": to_float(stats.get("expectedAssists")),
+                    "yellow_cards": to_int(stats.get("yellowCards")),
+                    "red_cards": to_int(stats.get("redCards")),
+                }
+        
+        # Fallback: return first season's stats
+        if seasons:
+            s = seasons[0]
+            stats = s.get("statistics", {})
+            return {
+                "goals": to_int(stats.get("goals")),
+                "assists": to_int(stats.get("assists")),
+                "appearances": to_int(stats.get("appearances")),
+                "minutes_played": to_int(stats.get("minutesPlayed")),
+                "xg": to_float(stats.get("expectedGoals")),
+                "xa": to_float(stats.get("expectedAssists")),
+                "yellow_cards": to_int(stats.get("yellowCards")),
+                "red_cards": to_int(stats.get("redCards")),
+            }
+    except Exception:
+        pass
+    return None
+
+
+def fetch_top_players_with_stats(ut_id, season_id, stat_type, get_stats=False):
+    """Fetch top players ranked by stat. If get_stats=True, also fetch per-player stats."""
+    rows = []
+    ut_name = ""
+    
+    try:
+        try:
+            j = api_get(f"unique-tournament/{ut_id}")
+            ut_name = j.get("uniqueTournament", {}).get("name", "")
+        except Exception:
+            pass
+        
+        j = api_get(f"unique-tournament/{ut_id}/season/{season_id}/players?order_by={stat_type}&limit=50")
+        players = j.get("players", [])
+        
+        for rank, p in enumerate(players, 1):
+            player_id = to_int(p.get("playerId"))
+            
+            # Fetch actual stats per player (方案 A — slow but accurate for goals)
+            stats_data = None
+            if get_stats and player_id:
+                stats_data = fetch_player_stats_for_season(player_id, season_id, ut_id)
+            
+            row = {
+                "player_id": player_id,
+                "player_name": p.get("playerName", ""),
+                "player_position": p.get("position", ""),
+                "team_id": to_int(p.get("teamId")),
+                "team_name": p.get("teamName", ""),
+                "rank": rank,
+                "stat_type": stat_type,
+                "ut_name": ut_name,
+                # Stats from /player/{id}/statistics (if available)
+                "goals": stats_data.get("goals") if stats_data else 0,
+                "assists": stats_data.get("assists") if stats_data else 0,
+                "appearances": stats_data.get("appearances") if stats_data else 0,
+                "minutes_played": stats_data.get("minutes_played") if stats_data else 0,
+                "xg": stats_data.get("xg") if stats_data else 0.0,
+                "xa": stats_data.get("xa") if stats_data else 0.0,
+                "yellow_cards": stats_data.get("yellow_cards") if stats_data else 0,
+                "red_cards": stats_data.get("red_cards") if stats_data else 0,
+            }
+            rows.append(row)
+        
+        return 200, rows, ut_name
+        
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return 404, [], ut_name
+        return e.code, [], ut_name
+    except Exception as e:
+        return 500, [], ut_name
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Backfill player season stats from SofaScore")
+    ap.add_argument("--db", default="data/backfill_sofascore_10y/player_stats.sqlite")
+    ap.add_argument("--state", default="data/backfill_sofascore_10y/player_stats_state.json")
+    ap.add_argument("--sleep-min", type=float, default=0.3)
+    ap.add_argument("--sleep-max", type=float, default=0.6)
+    ap.add_argument("--category-id", type=int, nargs="+", default=[])
+    ap.add_argument("--stat-type", default="goals")
+    ap.add_argument("--all-stats", action="store_true")
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--no-player-stats", action="store_true",
+                    help="Skip per-player /player/{id}/statistics calls (faster, less data)")
+    args = ap.parse_args()
+
+    db = sqlite3.connect(args.db)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout=60000")
+    ensure_tables(db)
+
+    state_path = Path(args.state)
+    state = load_state(state_path)
+
+    targets = []
+    stat_types = STAT_TYPES if args.all_stats else [args.stat_type]
+
+    if args.category_id:
+        cat_ids = args.category_id
+    elif args.all:
+        cat_ids = list(set(TOURNAMENT_IDS.values()))
+    else:
+        cat_ids = [1, 8, 9, 23]  # PL, La Liga, Bundesliga, Serie A
+
+    if args.limit and args.limit > 0:
+        cat_ids = cat_ids[:args.limit]
+
+    for cid in cat_ids:
+        ut_id = CAT_TO_UT.get(cid, cid)
+        for stat in stat_types:
+            targets.append((cid, ut_id, stat))
+
+    total = len(targets)
+    state["total_targets"] = total
+    save_state(state_path, state)
+    
+    # For goals stat, we always want per-player stats (方案 A)
+    # For other stats, only if --no-player-stats is not set
+    get_player_stats = not args.no_player_stats
+    print(f"[INFO] player_stats targets={total}, get_player_stats={get_player_stats}")
+
+    rows_upserted = 0
+
+    for (category_id, ut_id, stat_type) in targets:
+        status_code = 0
+        err = ""
+        local_rows = 0
+        season_id = 0
+
+        try:
+            season_id = get_season_id(ut_id)
+
+            if not season_id:
+                state["not_found"] += 1
+                status_code = 404
+            else:
+                # Only fetch per-player stats for primary stat types (goals, assists, xg)
+                do_get_stats = get_player_stats and stat_type in ("goals", "assists", "xg", "xa")
+                status_code, rows, ut_name = fetch_top_players_with_stats(
+                    ut_id, season_id, stat_type, get_stats=do_get_stats
+                )
+                
+                if status_code == 200 and rows:
+                    for r in rows:
+                        db.execute("""
+                            INSERT OR REPLACE INTO player_season_stats
+                            (category_id, ut_id, season_id, stat_type, rank, player_id, player_name,
+                             player_position, team_id, team_name, goals, assists, appearances,
+                             minutes_played, xg, xa, yellow_cards, red_cards, fetched_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            category_id, ut_id, season_id, stat_type,
+                            to_int(r.get("rank")),
+                            to_int(r.get("player_id")),
+                            r.get("player_name", ""),
+                            r.get("player_position", ""),
+                            to_int(r.get("team_id")),
+                            r.get("team_name", ""),
+                            to_int(r.get("goals")),
+                            to_int(r.get("assists")),
+                            to_int(r.get("appearances")),
+                            to_int(r.get("minutes_played")),
+                            to_float(r.get("xg")),
+                            to_float(r.get("xa")),
+                            to_int(r.get("yellow_cards")),
+                            to_int(r.get("red_cards")),
+                            now_iso(),
+                        ))
+                        local_rows += 1
+                        rows_upserted += 1
+                    state["ok"] += 1
+                    state["stat_rows"] += local_rows
+                elif status_code == 404:
+                    state["not_found"] += 1
+                else:
+                    state["errors"] += 1
+                    err = f"HTTP {status_code}"
+
+        except Exception as e:
+            state["errors"] += 1
+            err = str(e)
+
+        db.execute("""
+            INSERT INTO player_stats_fetch_log
+            (category_id, ut_id, season_id, stat_type, fetched_at, status_code, player_count, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (category_id, ut_id, season_id, stat_type, now_iso(), status_code, local_rows, err))
+
+        state["processed"] += 1
+
+        if state["processed"] % 20 == 0:
+            db.commit()
+            save_state(state_path, state)
+            pct = (state["processed"] / total) * 100
+            print(f"[CHK] {state['processed']}/{total} ({pct:.0f}%) ok={state['ok']} 404={state['not_found']} err={state['errors']}")
+
+        time.sleep(random.uniform(args.sleep_min, args.sleep_max))
+
+    db.commit()
+    save_state(state_path, state)
+    print(f"[DONE] player_stats: {rows_upserted} rows, ok={state['ok']}, 404={state['not_found']}, err={state['errors']}")
+
+
+if __name__ == "__main__":
+    main()

@@ -21,6 +21,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from mysql_helpers import ensure_mysql_tables, mysql_connect, use_mysql
+
 API_BASE = "https://www.sofascore.com/api/v1"
 
 
@@ -38,6 +40,10 @@ def api_get(path: str) -> tuple[int, dict]:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def now_mysql() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def ensure_tables(conn: sqlite3.Connection) -> None:
@@ -100,7 +106,39 @@ def fetch_lineups(event_id: int) -> tuple[int, dict]:
     return api_get(f"event/{event_id}/lineups")
 
 
+# ── MySQL upsert helpers ─────────────────────────────────────────────────────
+
+def _mysql_upsert_lineup_player(conn, event_id, is_home, team_id, team_name, player, fetched_ts):
+    player_info = player.get("player", {}) if isinstance(player.get("player"), dict) else player
+    player_id = to_int(player.get("playerId") or player_info.get("id") or player.get("id"))
+    if player_id is None:
+        return
+    player_name = player.get("playerName") or player_info.get("name") or player_info.get("shortName")
+    position = player.get("position") or player.get("positionName") or player.get("name")
+    position_type = player.get("positionType") or player.get("type")
+    jersey_number = to_int(player.get("jerseyNumber"))
+    captain = 1 if player.get("captain") is True else 0
+    player_key = str(player_id)
+
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO sofascore_lineups
+        (event_id, is_home, team_id, team_name, player_id, player_name,
+         position, position_type, jersey_number, captain, player_key, fetched_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+          team_name=VALUES(team_name), player_name=VALUES(player_name),
+          position=VALUES(position), position_type=VALUES(position_type),
+          jersey_number=VALUES(jersey_number), captain=VALUES(captain), fetched_at=VALUES(fetched_at)
+    """, (
+        event_id, is_home, team_id, team_name, player_id, player_name,
+        position, position_type, jersey_number, captain, player_key, fetched_ts,
+    ))
+    cur.close()
+
+
 def upsert_lineup_player(conn, event_id, is_home, team_id, team_name, player):
+    """SQLite-only lineup player upsert."""
     player_info = player.get("player", {}) if isinstance(player.get("player"), dict) else player
     player_id = to_int(player.get("playerId") or player_info.get("id") or player.get("id"))
     if player_id is None:
@@ -137,12 +175,23 @@ def main() -> None:
     ap.add_argument("--category-id", type=int, default=1)
     ap.add_argument("--season-id", type=int, default=61627)
     ap.add_argument("--past-only", action="store_true", default=True)
+    ap.add_argument("--use-mysql", action="store_true", help="Write to MySQL instead of SQLite")
     args = ap.parse_args()
 
-    db = sqlite3.connect(args.db)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA busy_timeout=60000")
-    ensure_tables(db)
+    is_mysql = args.use_mysql or use_mysql()
+
+    if is_mysql:
+        conn = mysql_connect()
+        ensure_mysql_tables(conn)
+        print(f"[INFO] Using MySQL (database: appdb)")
+        db = None  # type: ignore
+    else:
+        db = sqlite3.connect(args.db)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA busy_timeout=60000")
+        ensure_tables(db)
+        print(f"[INFO] Using SQLite: {args.db}")
+        conn = db
 
     state_path = Path(args.state)
     state = load_state(state_path)
@@ -160,8 +209,10 @@ def main() -> None:
             all_evs = [e for e in all_evs if e.get("startTimestamp", 9999999999) < now_ts]
         targets = [int(e["id"]) for e in all_evs if e.get("id")]
 
-    done_ids = set(r[0] for r in db.execute("SELECT event_id FROM lineup_events").fetchall())
-    targets = [eid for eid in targets if eid not in done_ids]
+    # Filter out already-processed (SQLite only; MySQL dedup by ON DUPLICATE KEY)
+    if not is_mysql:
+        done_ids = set(r[0] for r in db.execute("SELECT event_id FROM lineup_events").fetchall())
+        targets = [eid for eid in targets if eid not in done_ids]
 
     if args.limit and args.limit > 0:
         targets = targets[:args.limit]
@@ -192,42 +243,92 @@ def main() -> None:
                     team_id = to_int(team_block.get("id") or team_block.get("team", {}).get("id"))
                     team_name = team_block.get("name") or team_block.get("team", {}).get("name") or ""
                     players = team_block.get("players", []) or []
-                    for player in players:
-                        if upsert_lineup_player(db, event_id, is_home, team_id, team_name, player):
-                            upserted += 1
+                    fetched_ts = now_mysql() if is_mysql else now_iso()
+
+                if is_mysql:
+                    _mysql_upsert_lineup_player(conn, event_id, is_home, team_id, team_name, player, fetched_ts)
+                else:
+                    if upsert_lineup_player(db, event_id, is_home, team_id, team_name, player):
+                        upserted += 1
                 state["ok"] = int(state.get("ok", 0)) + 1
                 home_count = len(payload.get("home", {}).get("players", []))
                 away_count = len(payload.get("away", {}).get("players", []))
-                db.execute("""
-                    INSERT OR REPLACE INTO lineup_events
-                    (event_id, status_code, home_count, away_count, confirmed, fetched_at, error)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (event_id, status_code, home_count, away_count, confirmed, now_iso(), ""))
+
+                if is_mysql:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        INSERT INTO sofascore_lineup_events
+                        (event_id, status_code, home_count, away_count, confirmed, fetched_at, error)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE status_code=VALUES(status_code),
+                          home_count=VALUES(home_count), away_count=VALUES(away_count),
+                          confirmed=VALUES(confirmed), fetched_at=VALUES(fetched_at), error=VALUES(error)
+                    """, (event_id, status_code, home_count, away_count, confirmed, now_mysql(), ""))
+                    cur.close()
+                else:
+                    db.execute("""
+                        INSERT OR REPLACE INTO lineup_events
+                        (event_id, status_code, home_count, away_count, confirmed, fetched_at, error)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (event_id, status_code, home_count, away_count, confirmed, now_iso(), ""))
             elif status_code == 404:
                 state["not_found"] = int(state.get("not_found", 0)) + 1
                 err = "not found"
-                db.execute("""
-                    INSERT OR REPLACE INTO lineup_events
-                    (event_id, status_code, home_count, away_count, confirmed, fetched_at, error)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (event_id, status_code, 0, 0, 0, now_iso(), err))
+                if is_mysql:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        INSERT INTO sofascore_lineup_events
+                        (event_id, status_code, home_count, away_count, confirmed, fetched_at, error)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE status_code=VALUES(status_code),
+                          fetched_at=VALUES(fetched_at), error=VALUES(error)
+                    """, (event_id, status_code, 0, 0, 0, now_mysql(), err))
+                    cur.close()
+                else:
+                    db.execute("""
+                        INSERT OR REPLACE INTO lineup_events
+                        (event_id, status_code, home_count, away_count, confirmed, fetched_at, error)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (event_id, status_code, 0, 0, 0, now_iso(), err))
             else:
                 state["errors"] = int(state.get("errors", 0)) + 1
                 err = f"HTTP {status_code}"
-                db.execute("""
-                    INSERT OR REPLACE INTO lineup_events
-                    (event_id, status_code, home_count, away_count, confirmed, fetched_at, error)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (event_id, status_code, 0, 0, 0, now_iso(), err))
+                if is_mysql:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        INSERT INTO sofascore_lineup_events
+                        (event_id, status_code, home_count, away_count, confirmed, fetched_at, error)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE status_code=VALUES(status_code),
+                          fetched_at=VALUES(fetched_at), error=VALUES(error)
+                    """, (event_id, status_code, 0, 0, 0, now_mysql(), err))
+                    cur.close()
+                else:
+                    db.execute("""
+                        INSERT OR REPLACE INTO lineup_events
+                        (event_id, status_code, home_count, away_count, confirmed, fetched_at, error)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (event_id, status_code, 0, 0, 0, now_iso(), err))
 
         except Exception as e:
             state["errors"] = int(state.get("errors", 0)) + 1
             err = str(e)
-            db.execute("""
-                INSERT OR REPLACE INTO lineup_events
-                (event_id, status_code, home_count, away_count, confirmed, fetched_at, error)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (event_id, status_code, 0, 0, 0, now_iso(), err))
+            if is_mysql:
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO sofascore_lineup_events
+                    (event_id, status_code, home_count, away_count, confirmed, fetched_at, error)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE status_code=VALUES(status_code),
+                      fetched_at=VALUES(fetched_at), error=VALUES(error)
+                """, (event_id, status_code, 0, 0, 0, now_mysql(), err))
+                cur.close()
+            else:
+                db.execute("""
+                    INSERT OR REPLACE INTO lineup_events
+                    (event_id, status_code, home_count, away_count, confirmed, fetched_at, error)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (event_id, status_code, 0, 0, 0, now_iso(), err))
 
         state["players_upserted"] = int(state.get("players_upserted", 0)) + upserted
         state["processed"] = int(state.get("processed", 0)) + 1
@@ -235,7 +336,10 @@ def main() -> None:
         processed_run += 1
 
         if processed_run % args.checkpoint_every == 0:
-            db.commit()
+            if is_mysql:
+                conn.commit()
+            else:
+                db.commit()
             save_state(state_path, state)
             pct = (processed_run / total) * 100 if total else 100
             print(f"[CHK] run={processed_run}/{total} ({pct:.2f}%) "
@@ -244,7 +348,11 @@ def main() -> None:
 
         time.sleep(random.uniform(args.sleep_min, args.sleep_max))
 
-    db.commit()
+    if is_mysql:
+        conn.commit()
+    else:
+        db.commit()
+        db.close()
     save_state(state_path, state)
     print(f"[DONE] lineups completed: players={state['players_upserted']}")
 

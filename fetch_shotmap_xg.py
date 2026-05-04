@@ -27,6 +27,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from mysql_helpers import ensure_mysql_tables, mysql_connect, use_mysql
+
 API_BASE = "https://www.sofascore.com/api/v1"
 
 
@@ -44,6 +46,10 @@ def api_get(path: str) -> tuple[int, dict]:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def now_mysql() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def ensure_tables(conn: sqlite3.Connection) -> None:
@@ -106,14 +112,22 @@ def main() -> None:
     ap.add_argument("--season-id", type=int, default=61627,
                     help="Season ID for event discovery")
     ap.add_argument("--past-only", action="store_true", default=True)
+    ap.add_argument("--use-mysql", action="store_true", help="Write to MySQL instead of SQLite")
     args = ap.parse_args()
 
-    db_path = Path(args.db)
-    state_path = Path(args.state)
+    is_mysql = args.use_mysql or use_mysql()
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    ensure_tables(conn)
+    if is_mysql:
+        conn = mysql_connect()
+        ensure_mysql_tables(conn)
+        print(f"[INFO] Using MySQL (database: appdb)")
+        db = None  # type: ignore
+    else:
+        conn = sqlite3.connect(args.db)
+        conn.row_factory = sqlite3.Row
+        ensure_tables(conn)
+        print(f"[INFO] Using SQLite: {args.db}")
+        db = conn
 
     state = load_state(state_path)
 
@@ -131,9 +145,10 @@ def main() -> None:
             all_evs = [e for e in all_evs if e.get("startTimestamp", 9999999999) < now_ts]
         targets = [int(e["id"]) for e in all_evs if e.get("id")]
 
-    # Filter out already-processed
-    done_ids = set(r[0] for r in conn.execute("SELECT event_id FROM shotmap_xg_backfill").fetchall())
-    targets = [eid for eid in targets if eid not in done_ids]
+    # Filter out already-processed (SQLite only; MySQL dedup by ON DUPLICATE KEY)
+    if not is_mysql:
+        done_ids = set(r[0] for r in conn.execute("SELECT event_id FROM shotmap_xg_backfill").fetchall())
+        targets = [eid for eid in targets if eid not in done_ids]
 
     if args.limit and args.limit > 0:
         targets = targets[:args.limit]
@@ -182,16 +197,37 @@ def main() -> None:
         except Exception as e:
             err = str(e)
 
-        conn.execute("""
-            INSERT OR REPLACE INTO shotmap_xg_backfill
-            (event_id, status_code, has_shotmap, has_xg,
-             shot_count, home_shotmap_xg, away_shotmap_xg, fetched_at, error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            event_id, status_code, has_shotmap, has_xg,
-            shot_count, round(home_xg, 6), round(away_xg, 6),
-            now_iso(), err,
-        ))
+        fetched_ts = now_mysql() if is_mysql else now_iso()
+
+        if is_mysql:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO sofascore_shotmap_xg_backfill
+                (event_id, status_code, has_shotmap, has_xg,
+                 shot_count, home_shotmap_xg, away_shotmap_xg, fetched_at, error)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                  status_code=VALUES(status_code), has_shotmap=VALUES(has_shotmap),
+                  has_xg=VALUES(has_xg), shot_count=VALUES(shot_count),
+                  home_shotmap_xg=VALUES(home_shotmap_xg), away_shotmap_xg=VALUES(away_shotmap_xg),
+                  fetched_at=VALUES(fetched_at), error=VALUES(error)
+            """, (
+                event_id, status_code, has_shotmap, has_xg,
+                shot_count, round(home_xg, 6), round(away_xg, 6),
+                fetched_ts, err,
+            ))
+            cur.close()
+        else:
+            conn.execute("""
+                INSERT OR REPLACE INTO shotmap_xg_backfill
+                (event_id, status_code, has_shotmap, has_xg,
+                 shot_count, home_shotmap_xg, away_shotmap_xg, fetched_at, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                event_id, status_code, has_shotmap, has_xg,
+                shot_count, round(home_xg, 6), round(away_xg, 6),
+                fetched_ts, err,
+            ))
 
         state["processed"] = int(state.get("processed", 0)) + 1
         processed_in_run += 1
@@ -210,7 +246,10 @@ def main() -> None:
             state["has_xg"] = int(state.get("has_xg", 0)) + 1
 
         if processed_in_run % args.checkpoint_every == 0:
-            conn.commit()
+            if is_mysql:
+                conn.commit()
+            else:
+                db.commit()
             save_state(state_path, state)
             pct = (processed_in_run / total_targets) * 100 if total_targets else 100
             print(f"[CHK] run={processed_in_run}/{total_targets} ({pct:.2f}%) "
@@ -219,7 +258,11 @@ def main() -> None:
 
         time.sleep(random.uniform(args.sleep_min, args.sleep_max))
 
-    conn.commit()
+    if is_mysql:
+        conn.commit()
+    else:
+        db.commit()
+        db.close()
     save_state(state_path, state)
     print(f"[DONE] shotmap_xg: processed={processed_in_run} ok={state['ok']} "
           f"404={state['not_found']} err={state['errors']} has_xg={state['has_xg']}")

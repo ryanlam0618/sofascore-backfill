@@ -9,9 +9,7 @@ Uses two API calls per player:
   2. GET /player/{player_id}/statistics
      → Returns full stats for that player (goals, assists, xG, apps, etc.)
 
-方案 A: For goals-ordered list, we fetch actual goal counts from /player/{id}/statistics.
-For other stat types, we use order_by rank as proxy (API provides ranking but not values).
-
+Supports MySQL via USE_MYSQL=1 or --use-mysql flag.
 Resume-safe with sqlite + state JSON.
 """
 
@@ -26,6 +24,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from mysql_helpers import ensure_mysql_tables, mysql_connect, use_mysql
+
 API_BASE = "https://www.sofascore.com/api/v1"
 
 TOURNAMENT_IDS = {
@@ -35,13 +35,11 @@ TOURNAMENT_IDS = {
     "j1-league": 94, "k-league-1": 245, "a-league": 314,
 }
 
-# category_id -> uniqueTournament_id mapping (confirmed from API)
 CAT_TO_UT = {
     1: 17,   2: 18,   3: 24,   8: 8,    23: 23,  9: 9,    4: 34,
     7: 7,    459: 459, 94: 94,  245: 245, 314: 314,
 }
 
-# Stats supported by order_by parameter
 STAT_TYPES = [
     "goals", "assists", "xg", "xa", "minutes",
     "appearances", "yellowCards", "redCards",
@@ -53,7 +51,13 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def ensure_tables(conn):
+def now_mysql():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ensure_tables(conn, is_mysql=False):
+    if is_mysql:
+        return  # Tables created via ensure_mysql_tables()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS player_stats_fetch_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,18 +154,14 @@ def fetch_player_stats_for_season(player_id, target_season_id, target_ut_id):
     try:
         j = api_get(f"player/{player_id}/statistics")
         seasons = j.get("seasons", [])
-        # Find the matching season for target tournament
         for s in seasons:
             ut = s.get("uniqueTournament", {})
             stats = s.get("statistics", {})
             ut_id_val = to_int(ut.get("id") if isinstance(ut, dict) else ut)
             season_id_val = to_int(s.get("season", {}).get("id") if isinstance(s.get("season"), dict) else s.get("season", {}).get("id"))
-            
-            # Match by ut_id first, then season_id
+
             if ut_id_val == target_ut_id or ut_id_val == 0:
-                # Check if this is the target season
                 if target_season_id and season_id_val and season_id_val != target_season_id:
-                    # Season mismatch - try to find current season
                     continue
                 return {
                     "goals": to_int(stats.get("goals")),
@@ -173,8 +173,7 @@ def fetch_player_stats_for_season(player_id, target_season_id, target_ut_id):
                     "yellow_cards": to_int(stats.get("yellowCards")),
                     "red_cards": to_int(stats.get("redCards")),
                 }
-        
-        # Fallback: try to match by season id only (handles UT id mismatch)
+
         for s in seasons:
             stats = s.get("statistics", {})
             season_id_val = to_int(s.get("season", {}).get("id") if isinstance(s.get("season"), dict) else 0)
@@ -189,8 +188,7 @@ def fetch_player_stats_for_season(player_id, target_season_id, target_ut_id):
                     "yellow_cards": to_int(stats.get("yellowCards")),
                     "red_cards": to_int(stats.get("redCards")),
                 }
-        
-        # Fallback: return first season's stats
+
         if seasons:
             s = seasons[0]
             stats = s.get("statistics", {})
@@ -213,25 +211,24 @@ def fetch_top_players_with_stats(ut_id, season_id, stat_type, get_stats=False):
     """Fetch top players ranked by stat. If get_stats=True, also fetch per-player stats."""
     rows = []
     ut_name = ""
-    
+
     try:
         try:
             j = api_get(f"unique-tournament/{ut_id}")
             ut_name = j.get("uniqueTournament", {}).get("name", "")
         except Exception:
             pass
-        
+
         j = api_get(f"unique-tournament/{ut_id}/season/{season_id}/players?order_by={stat_type}&limit=50")
         players = j.get("players", [])
-        
+
         for rank, p in enumerate(players, 1):
             player_id = to_int(p.get("playerId"))
-            
-            # Fetch actual stats per player (方案 A — slow but accurate for goals)
+
             stats_data = None
             if get_stats and player_id:
                 stats_data = fetch_player_stats_for_season(player_id, season_id, ut_id)
-            
+
             row = {
                 "player_id": player_id,
                 "player_name": p.get("playerName", ""),
@@ -241,7 +238,6 @@ def fetch_top_players_with_stats(ut_id, season_id, stat_type, get_stats=False):
                 "rank": rank,
                 "stat_type": stat_type,
                 "ut_name": ut_name,
-                # Stats from /player/{id}/statistics (if available)
                 "goals": stats_data.get("goals") if stats_data else 0,
                 "assists": stats_data.get("assists") if stats_data else 0,
                 "appearances": stats_data.get("appearances") if stats_data else 0,
@@ -252,15 +248,61 @@ def fetch_top_players_with_stats(ut_id, season_id, stat_type, get_stats=False):
                 "red_cards": stats_data.get("red_cards") if stats_data else 0,
             }
             rows.append(row)
-        
+
         return 200, rows, ut_name
-        
+
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return 404, [], ut_name
         return e.code, [], ut_name
     except Exception as e:
         return 500, [], ut_name
+
+
+def mysql_upsert_player_stat(conn, category_id, ut_id, season_id, stat_type, r, fetched_ts):
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO sofascore_player_season_stats
+        (category_id, ut_id, season_id, stat_type, `rank`, player_id, player_name,
+         player_position, team_id, team_name, goals, assists, appearances,
+         minutes_played, xg, xa, yellow_cards, red_cards, fetched_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+          player_name=VALUES(player_name), player_position=VALUES(player_position),
+          team_id=VALUES(team_id), team_name=VALUES(team_name),
+          goals=VALUES(goals), assists=VALUES(assists), appearances=VALUES(appearances),
+          minutes_played=VALUES(minutes_played), xg=VALUES(xg), xa=VALUES(xa),
+          yellow_cards=VALUES(yellow_cards), red_cards=VALUES(red_cards), fetched_at=VALUES(fetched_at)
+    """, (
+        category_id, ut_id, season_id, stat_type,
+        to_int(r.get("rank")),
+        to_int(r.get("player_id")),
+        r.get("player_name", ""),
+        r.get("player_position", ""),
+        to_int(r.get("team_id")),
+        r.get("team_name", ""),
+        to_int(r.get("goals")),
+        to_int(r.get("assists")),
+        to_int(r.get("appearances")),
+        to_int(r.get("minutes_played")),
+        to_float(r.get("xg")),
+        to_float(r.get("xa")),
+        to_int(r.get("yellow_cards")),
+        to_int(r.get("red_cards")),
+        fetched_ts,
+    ))
+    cur.close()
+
+
+def mysql_log_player_stats(conn, category_id, ut_id, season_id, stat_type, fetched_ts, status_code, local_rows, err):
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO sofascore_player_stats_fetch_log
+        (category_id, ut_id, season_id, stat_type, fetched_at, status_code, player_count, error)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE fetched_at=VALUES(fetched_at)
+    """, (category_id, ut_id, season_id, stat_type, fetched_ts, status_code, local_rows, err))
+    cur.close()
 
 
 def main():
@@ -276,12 +318,21 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--no-player-stats", action="store_true",
                     help="Skip per-player /player/{id}/statistics calls (faster, less data)")
+    ap.add_argument("--use-mysql", action="store_true", help="Write to MySQL instead of SQLite")
     args = ap.parse_args()
 
-    db = sqlite3.connect(args.db)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA busy_timeout=60000")
-    ensure_tables(db)
+    is_mysql = args.use_mysql or use_mysql()
+
+    if is_mysql:
+        conn = mysql_connect()
+        ensure_mysql_tables(conn)
+        print(f"[INFO] Using MySQL (database: appdb)")
+    else:
+        conn = sqlite3.connect(args.db)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=60000")
+        ensure_tables(conn, is_mysql=False)
+        print(f"[INFO] Using SQLite: {args.db}")
 
     state_path = Path(args.state)
     state = load_state(state_path)
@@ -294,7 +345,7 @@ def main():
     elif args.all:
         cat_ids = list(set(TOURNAMENT_IDS.values()))
     else:
-        cat_ids = [1, 8, 9, 23]  # PL, La Liga, Bundesliga, Serie A
+        cat_ids = [1, 8, 9, 23]
 
     if args.limit and args.limit > 0:
         cat_ids = cat_ids[:args.limit]
@@ -307,9 +358,7 @@ def main():
     total = len(targets)
     state["total_targets"] = total
     save_state(state_path, state)
-    
-    # For goals stat, we always want per-player stats (方案 A)
-    # For other stats, only if --no-player-stats is not set
+
     get_player_stats = not args.no_player_stats
     print(f"[INFO] player_stats targets={total}, get_player_stats={get_player_stats}")
 
@@ -328,40 +377,47 @@ def main():
                 state["not_found"] += 1
                 status_code = 404
             else:
-                # Only fetch per-player stats for primary stat types (goals, assists, xg)
                 do_get_stats = get_player_stats and stat_type in ("goals", "assists", "xg", "xa")
                 status_code, rows, ut_name = fetch_top_players_with_stats(
                     ut_id, season_id, stat_type, get_stats=do_get_stats
                 )
-                
+
                 if status_code == 200 and rows:
-                    for r in rows:
-                        db.execute("""
-                            INSERT OR REPLACE INTO player_season_stats
-                            (category_id, ut_id, season_id, stat_type, rank, player_id, player_name,
-                             player_position, team_id, team_name, goals, assists, appearances,
-                             minutes_played, xg, xa, yellow_cards, red_cards, fetched_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            category_id, ut_id, season_id, stat_type,
-                            to_int(r.get("rank")),
-                            to_int(r.get("player_id")),
-                            r.get("player_name", ""),
-                            r.get("player_position", ""),
-                            to_int(r.get("team_id")),
-                            r.get("team_name", ""),
-                            to_int(r.get("goals")),
-                            to_int(r.get("assists")),
-                            to_int(r.get("appearances")),
-                            to_int(r.get("minutes_played")),
-                            to_float(r.get("xg")),
-                            to_float(r.get("xa")),
-                            to_int(r.get("yellow_cards")),
-                            to_int(r.get("red_cards")),
-                            now_iso(),
-                        ))
-                        local_rows += 1
-                        rows_upserted += 1
+                    fetched_ts = now_mysql() if is_mysql else now_iso()
+
+                    if is_mysql:
+                        for r in rows:
+                            mysql_upsert_player_stat(conn, category_id, ut_id, season_id, stat_type, r, fetched_ts)
+                            local_rows += 1
+                            rows_upserted += 1
+                    else:
+                        for r in rows:
+                            conn.execute("""
+                                INSERT OR REPLACE INTO player_season_stats
+                                (category_id, ut_id, season_id, stat_type, rank, player_id, player_name,
+                                 player_position, team_id, team_name, goals, assists, appearances,
+                                 minutes_played, xg, xa, yellow_cards, red_cards, fetched_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                category_id, ut_id, season_id, stat_type,
+                                to_int(r.get("rank")),
+                                to_int(r.get("player_id")),
+                                r.get("player_name", ""),
+                                r.get("player_position", ""),
+                                to_int(r.get("team_id")),
+                                r.get("team_name", ""),
+                                to_int(r.get("goals")),
+                                to_int(r.get("assists")),
+                                to_int(r.get("appearances")),
+                                to_int(r.get("minutes_played")),
+                                to_float(r.get("xg")),
+                                to_float(r.get("xa")),
+                                to_int(r.get("yellow_cards")),
+                                to_int(r.get("red_cards")),
+                                fetched_ts,
+                            ))
+                            local_rows += 1
+                            rows_upserted += 1
                     state["ok"] += 1
                     state["stat_rows"] += local_rows
                 elif status_code == 404:
@@ -374,23 +430,33 @@ def main():
             state["errors"] += 1
             err = str(e)
 
-        db.execute("""
-            INSERT INTO player_stats_fetch_log
-            (category_id, ut_id, season_id, stat_type, fetched_at, status_code, player_count, error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (category_id, ut_id, season_id, stat_type, now_iso(), status_code, local_rows, err))
+        if is_mysql:
+            mysql_log_player_stats(conn, category_id, ut_id, season_id, stat_type, now_mysql(), status_code, local_rows, err)
+        else:
+            conn.execute("""
+                INSERT INTO player_stats_fetch_log
+                (category_id, ut_id, season_id, stat_type, fetched_at, status_code, player_count, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (category_id, ut_id, season_id, stat_type, now_iso(), status_code, local_rows, err))
 
         state["processed"] += 1
 
         if state["processed"] % 20 == 0:
-            db.commit()
+            if is_mysql:
+                conn.commit()
+            else:
+                conn.commit()
             save_state(state_path, state)
             pct = (state["processed"] / total) * 100
             print(f"[CHK] {state['processed']}/{total} ({pct:.0f}%) ok={state['ok']} 404={state['not_found']} err={state['errors']}")
 
         time.sleep(random.uniform(args.sleep_min, args.sleep_max))
 
-    db.commit()
+    if is_mysql:
+        conn.commit()
+    else:
+        conn.commit()
+        conn.close()
     save_state(state_path, state)
     print(f"[DONE] player_stats: {rows_upserted} rows, ok={state['ok']}, 404={state['not_found']}, err={state['errors']}")
 

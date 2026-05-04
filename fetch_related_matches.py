@@ -7,6 +7,7 @@ API: GET /event/{event_id}/h2h
 Returns teamDuel with { homeWins, draws, awayWins } — aggregate stats, NOT individual events.
 The allEvents array is empty in current SofaScore API.
 
+Supports MySQL via USE_MYSQL=1 or --use-mysql flag.
 Resume-safe with sqlite + state JSON.
 """
 
@@ -20,6 +21,8 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+from mysql_helpers import ensure_mysql_tables, mysql_connect, use_mysql
 
 API_BASE = "https://www.sofascore.com/api/v1"
 
@@ -35,6 +38,10 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def now_mysql():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def to_int(v, default=0):
     try:
         return int(float(v))
@@ -42,7 +49,9 @@ def to_int(v, default=0):
         return default
 
 
-def ensure_tables(conn):
+def ensure_tables(conn, is_mysql=False):
+    if is_mysql:
+        return
     conn.execute("""
         CREATE TABLE IF NOT EXISTS related_matches_fetch_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,7 +61,6 @@ def ensure_tables(conn):
           error TEXT
         )
     """)
-    # H2H aggregated stats
     conn.execute("""
         CREATE TABLE IF NOT EXISTS related_matches (
           source_event_id INTEGER,
@@ -98,7 +106,6 @@ def get_past_event_ids(limit=100):
         all_evs = j.get("events", []) if isinstance(j, dict) else (j if isinstance(j, list) else [])
         now = datetime.now().timestamp()
         past = [e for e in all_evs if e.get("startTimestamp", 9999999999) < now]
-        # Also include future events for completeness
         all_events = past + [e for e in all_evs if e not in past]
         for e in all_events[:limit]:
             events.append({
@@ -121,23 +128,60 @@ def fetch_h2h(event_id):
     try:
         j = api_get(f"event/{event_id}/h2h")
         td = j.get("teamDuel", {})
-        
+
         home_wins = to_int(td.get("homeWins"))
         draws = to_int(td.get("draws"))
         away_wins = to_int(td.get("awayWins"))
         total = home_wins + draws + away_wins
-        
+
         return (200, {
             "home_wins": home_wins,
             "draws": draws,
             "away_wins": away_wins,
             "total_h2h": total,
         })
-        
+
     except urllib.error.HTTPError as e:
         return (e.code if e.code != 404 else 404, None)
     except Exception:
         return (500, None)
+
+
+# ── MySQL upsert helpers ─────────────────────────────────────────────────────
+
+def mysql_upsert_h2h(conn, event_id, home_id, home_name, away_id, away_name,
+                     cat_id, league_name, ts, h2h_data, fetched_ts):
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO sofascore_related_matches
+        (source_event_id, home_team_id, home_team_name, away_team_id, away_team_name,
+         league_category_id, league_name, match_timestamp, home_wins, draws, away_wins,
+         total_h2h, fetched_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+          home_team_name=VALUES(home_team_name), away_team_name=VALUES(away_team_name),
+          league_name=VALUES(league_name), match_timestamp=VALUES(match_timestamp),
+          home_wins=VALUES(home_wins), draws=VALUES(draws), away_wins=VALUES(away_wins),
+          total_h2h=VALUES(total_h2h), fetched_at=VALUES(fetched_at)
+    """, (
+        event_id, home_id, home_name, away_id, away_name,
+        cat_id, league_name, ts,
+        h2h_data.get("home_wins", 0), h2h_data.get("draws", 0),
+        h2h_data.get("away_wins", 0), h2h_data.get("total_h2h", 0),
+        fetched_ts,
+    ))
+    cur.close()
+
+
+def mysql_log_h2h(conn, event_id, fetched_ts, status_code, err):
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO sofascore_related_matches_fetch_log
+        (source_event_id, fetched_at, status_code, error)
+        VALUES (%s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE fetched_at=VALUES(fetched_at)
+    """, (event_id, fetched_ts, status_code, err))
+    cur.close()
 
 
 def main():
@@ -150,22 +194,31 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--source-league", default="pl",
                     help="Source league for event IDs (pl=PL, laliga=La Liga, etc.)")
+    ap.add_argument("--use-mysql", action="store_true", help="Write to MySQL instead of SQLite")
     args = ap.parse_args()
 
-    db = sqlite3.connect(args.db)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA busy_timeout=60000")
-    ensure_tables(db)
+    is_mysql = args.use_mysql or use_mysql()
+
+    if is_mysql:
+        conn = mysql_connect()
+        ensure_mysql_tables(conn)
+        print(f"[INFO] Using MySQL (database: appdb)")
+    else:
+        conn = sqlite3.connect(args.db)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=60000")
+        ensure_tables(conn, is_mysql=False)
+        print(f"[INFO] Using SQLite: {args.db}")
 
     state_path = Path(args.state)
     state = load_state(state_path)
-    
+
     targets = args.event_id
 
     if not targets:
         events = get_past_event_ids(limit=500)
         targets = [e["event_id"] for e in events]
-    
+
     if args.limit and args.limit > 0:
         targets = targets[:args.limit]
 
@@ -186,9 +239,8 @@ def main():
         h2h_data = None
         try:
             status_code, h2h_data = fetch_h2h(event_id)
-            
+
             if status_code == 200 and h2h_data and h2h_data.get("total_h2h", 0) > 0:
-                # Get event details
                 try:
                     ev_j = api_get(f"event/{event_id}")
                     ev = ev_j.get("event", ev_j)
@@ -208,19 +260,25 @@ def main():
                     home_id = 0; home_name = ""; away_id = 0; away_name = ""
                     ts = 0; cat_id = 1; league_name = "Unknown"
 
-                db.execute("""
-                    INSERT OR REPLACE INTO related_matches
-                    (source_event_id, home_team_id, home_team_name, away_team_id, away_team_name,
-                     league_category_id, league_name, match_timestamp, home_wins, draws, away_wins,
-                     total_h2h, fetched_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    event_id, home_id, home_name, away_id, away_name,
-                    cat_id, league_name, ts,
-                    h2h_data.get("home_wins", 0), h2h_data.get("draws", 0),
-                    h2h_data.get("away_wins", 0), h2h_data.get("total_h2h", 0),
-                    now_iso(),
-                ))
+                fetched_ts = now_mysql() if is_mysql else now_iso()
+
+                if is_mysql:
+                    mysql_upsert_h2h(conn, event_id, home_id, home_name, away_id, away_name,
+                                     cat_id, league_name, ts, h2h_data, fetched_ts)
+                else:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO related_matches
+                        (source_event_id, home_team_id, home_team_name, away_team_id, away_team_name,
+                         league_category_id, league_name, match_timestamp, home_wins, draws, away_wins,
+                         total_h2h, fetched_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        event_id, home_id, home_name, away_id, away_name,
+                        cat_id, league_name, ts,
+                        h2h_data.get("home_wins", 0), h2h_data.get("draws", 0),
+                        h2h_data.get("away_wins", 0), h2h_data.get("total_h2h", 0),
+                        fetched_ts,
+                    ))
                 local_rows = 1
                 rows_upserted += 1
                 state["ok"] += 1
@@ -230,26 +288,36 @@ def main():
             else:
                 state["errors"] += 1
                 err = f"HTTP {status_code}"
-                
+
         except Exception as e:
             state["errors"] += 1
             err = str(e)
 
-        db.execute(
-            "INSERT INTO related_matches_fetch_log (source_event_id, fetched_at, status_code, error) "
-            "VALUES (?, ?, ?, ?)",
-            (event_id, now_iso(), status_code, err))
+        if is_mysql:
+            mysql_log_h2h(conn, event_id, now_mysql(), status_code, err)
+        else:
+            conn.execute(
+                "INSERT INTO related_matches_fetch_log (source_event_id, fetched_at, status_code, error) "
+                "VALUES (?, ?, ?, ?)",
+                (event_id, now_iso(), status_code, err))
         state["processed"] += 1
 
         if state["processed"] % 50 == 0:
-            db.commit()
+            if is_mysql:
+                conn.commit()
+            else:
+                conn.commit()
             save_state(state_path, state)
             pct = (state["processed"] / len(targets)) * 100
             print(f"[CHK] {state['processed']}/{len(targets)} ({pct:.0f}%) ok={state['ok']} 404={state['not_found']} err={state['errors']}")
 
         time.sleep(random.uniform(args.sleep_min, args.sleep_max))
 
-    db.commit()
+    if is_mysql:
+        conn.commit()
+    else:
+        conn.commit()
+        conn.close()
     save_state(state_path, state)
     print(f"[DONE] related_matches: {rows_upserted} rows with H2H data, ok={state['ok']}, 404={state['not_found']}, err={state['errors']}")
 

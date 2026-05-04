@@ -7,6 +7,7 @@ Covers: Goals, cards, substitutions, penalties, VAR, etc. with minute, added tim
 API: GET https://www.sofascore.com/api/v1/event/{event_id}/incidents
 Status: ✅ Direct API confirmed working (2026-05-03)
 
+Supports MySQL via USE_MYSQL=1 or --use-mysql flag.
 Resume-safe with sqlite + state JSON.
 """
 
@@ -20,6 +21,8 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+from mysql_helpers import ensure_mysql_tables, mysql_connect, use_mysql
 
 API_BASE = "https://www.sofascore.com/api/v1"
 
@@ -38,6 +41,10 @@ def api_get(path: str) -> tuple[int, dict]:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def now_mysql() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def ensure_tables(conn: sqlite3.Connection) -> None:
@@ -144,12 +151,23 @@ def main() -> None:
     ap.add_argument("--season-id", type=int, default=61627, help="Season ID for event discovery")
     ap.add_argument("--past-only", action="store_true", default=True,
                     help="Only fetch past (finished) matches")
+    ap.add_argument("--use-mysql", action="store_true", help="Write to MySQL instead of SQLite")
     args = ap.parse_args()
 
-    db = sqlite3.connect(args.db)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA busy_timeout=60000")
-    ensure_tables(db)
+    is_mysql = args.use_mysql or use_mysql()
+
+    if is_mysql:
+        conn = mysql_connect()
+        ensure_mysql_tables(conn)
+        print(f"[INFO] Using MySQL (database: appdb)")
+        db = None  # type: ignore
+    else:
+        db = sqlite3.connect(args.db)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA busy_timeout=60000")
+        ensure_tables(db)
+        print(f"[INFO] Using SQLite: {args.db}")
+        conn = db
 
     state_path = Path(args.state)
     state = load_state(state_path)
@@ -158,7 +176,6 @@ def main() -> None:
     if args.event_id:
         targets = args.event_id
     else:
-        # Discover event IDs from season events endpoint
         status, ev_data = api_get(f"tournament/{args.category_id}/season/{args.season_id}/events")
         if status != 200:
             print(f"[ERROR] Could not fetch events: HTTP {status}")
@@ -169,9 +186,10 @@ def main() -> None:
             all_evs = [e for e in all_evs if e.get("startTimestamp", 9999999999) < now_ts]
         targets = [int(e["id"]) for e in all_evs if e.get("id")]
 
-    # Filter out already-processed
-    done_ids = set(r[0] for r in db.execute("SELECT event_id FROM incident_events").fetchall())
-    targets = [eid for eid in targets if eid not in done_ids]
+    # Filter out already-processed (SQLite only; MySQL dedup handled by ON DUPLICATE KEY)
+    if not is_mysql:
+        done_ids = set(r[0] for r in db.execute("SELECT event_id FROM incident_events").fetchall())
+        targets = [eid for eid in targets if eid not in done_ids]
 
     if args.limit and args.limit > 0:
         targets = targets[:args.limit]
@@ -197,42 +215,98 @@ def main() -> None:
 
             if status_code == 200:
                 for inc in incidents:
-                    db.execute("""
-                        INSERT OR REPLACE INTO incidents
-                        (event_id, incident_id, match_date, league, home_team, away_team,
-                         incident_type, minute, added_time, time_seconds, period_time_seconds,
-                         is_home_incident, team_id, team_name,
-                         player_id, player_name,
-                         related_player_id, related_player_name,
-                         assist_player_id, assist_player_name,
-                         reason, text, coordinates_x, coordinates_y, in_stats, fetched_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        event_id,
-                        to_int(inc.get("id")),
-                        "", "", "", "",  # match metadata filled from incident_events
-                        inc.get("incidentType"),
-                        to_int(inc.get("time")),
-                        to_int(inc.get("addedTime")),
-                        to_int(inc.get("timeSeconds")),
-                        to_int(inc.get("periodTimeSeconds")),
-                        1 if inc.get("isHome") is True else 0 if inc.get("isHome") is False else None,
-                        to_int((inc.get("team") or {}).get("id") if isinstance(inc.get("team"), dict) else None),
-                        (inc.get("team") or {}).get("name") if isinstance(inc.get("team"), dict) else None,
-                        to_int((inc.get("player") or {}).get("id") if isinstance(inc.get("player"), dict) else None),
-                        (inc.get("player") or {}).get("name") if isinstance(inc.get("player"), dict) else None,
-                        to_int((inc.get("relatedPlayer") or {}).get("id") if isinstance(inc.get("relatedPlayer"), dict) else None),
-                        (inc.get("relatedPlayer") or {}).get("name") if isinstance(inc.get("relatedPlayer"), dict) else None,
-                        to_int((inc.get("assist") or {}).get("id") if isinstance(inc.get("assist"), dict) else None),
-                        (inc.get("assist") or {}).get("name") if isinstance(inc.get("assist"), dict) else None,
-                        inc.get("reason"),
-                        inc.get("text"),
-                        to_float((inc.get("coordinates") or {}).get("x") if isinstance(inc.get("coordinates"), dict) else None),
-                        to_float((inc.get("coordinates") or {}).get("y") if isinstance(inc.get("coordinates"), dict) else None),
-                        1 if inc.get("inStats") is True else 0 if inc.get("inStats") is False else None,
-                        now_iso(),
-                    ))
-                    upserted += 1
+                    fetched_ts = now_mysql() if is_mysql else now_iso()
+
+                    if is_mysql:
+                        cur = conn.cursor()
+                        cur.execute("""
+                            INSERT INTO sofascore_incidents
+                            (event_id, incident_id, match_date, league, home_team, away_team,
+                             incident_type, minute, added_time, time_seconds, period_time_seconds,
+                             is_home_incident, team_id, team_name,
+                             player_id, player_name,
+                             related_player_id, related_player_name,
+                             assist_player_id, assist_player_name,
+                             reason, text, coordinates_x, coordinates_y, in_stats, fetched_at)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON DUPLICATE KEY UPDATE
+                              match_date=VALUES(match_date), league=VALUES(league),
+                              home_team=VALUES(home_team), away_team=VALUES(away_team),
+                              incident_type=VALUES(incident_type), minute=VALUES(minute),
+                              added_time=VALUES(added_time), time_seconds=VALUES(time_seconds),
+                              period_time_seconds=VALUES(period_time_seconds),
+                              is_home_incident=VALUES(is_home_incident), team_id=VALUES(team_id),
+                              team_name=VALUES(team_name), player_id=VALUES(player_id),
+                              player_name=VALUES(player_name), related_player_id=VALUES(related_player_id),
+                              related_player_name=VALUES(related_player_name),
+                              assist_player_id=VALUES(assist_player_id),
+                              assist_player_name=VALUES(assist_player_name),
+                              reason=VALUES(reason), text=VALUES(text),
+                              coordinates_x=VALUES(coordinates_x), coordinates_y=VALUES(coordinates_y),
+                              in_stats=VALUES(in_stats), fetched_at=VALUES(fetched_at)
+                        """, (
+                            event_id,
+                            to_int(inc.get("id")),
+                            "", "", "", "",
+                            inc.get("incidentType"),
+                            to_int(inc.get("time")),
+                            to_int(inc.get("addedTime")),
+                            to_int(inc.get("timeSeconds")),
+                            to_int(inc.get("periodTimeSeconds")),
+                            1 if inc.get("isHome") is True else 0 if inc.get("isHome") is False else None,
+                            to_int((inc.get("team") or {}).get("id") if isinstance(inc.get("team"), dict) else None),
+                            (inc.get("team") or {}).get("name") if isinstance(inc.get("team"), dict) else None,
+                            to_int((inc.get("player") or {}).get("id") if isinstance(inc.get("player"), dict) else None),
+                            (inc.get("player") or {}).get("name") if isinstance(inc.get("player"), dict) else None,
+                            to_int((inc.get("relatedPlayer") or {}).get("id") if isinstance(inc.get("relatedPlayer"), dict) else None),
+                            (inc.get("relatedPlayer") or {}).get("name") if isinstance(inc.get("relatedPlayer"), dict) else None,
+                            to_int((inc.get("assist") or {}).get("id") if isinstance(inc.get("assist"), dict) else None),
+                            (inc.get("assist") or {}).get("name") if isinstance(inc.get("assist"), dict) else None,
+                            inc.get("reason"),
+                            inc.get("text"),
+                            to_float((inc.get("coordinates") or {}).get("x") if isinstance(inc.get("coordinates"), dict) else None),
+                            to_float((inc.get("coordinates") or {}).get("y") if isinstance(inc.get("coordinates"), dict) else None),
+                            1 if inc.get("inStats") is True else 0 if inc.get("inStats") is False else None,
+                            fetched_ts,
+                        ))
+                        cur.close()
+                    else:
+                        db.execute("""
+                            INSERT OR REPLACE INTO incidents
+                            (event_id, incident_id, match_date, league, home_team, away_team,
+                             incident_type, minute, added_time, time_seconds, period_time_seconds,
+                             is_home_incident, team_id, team_name,
+                             player_id, player_name,
+                             related_player_id, related_player_name,
+                             assist_player_id, assist_player_name,
+                             reason, text, coordinates_x, coordinates_y, in_stats, fetched_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            event_id,
+                            to_int(inc.get("id")),
+                            "", "", "", "",
+                            inc.get("incidentType"),
+                            to_int(inc.get("time")),
+                            to_int(inc.get("addedTime")),
+                            to_int(inc.get("timeSeconds")),
+                            to_int(inc.get("periodTimeSeconds")),
+                            1 if inc.get("isHome") is True else 0 if inc.get("isHome") is False else None,
+                            to_int((inc.get("team") or {}).get("id") if isinstance(inc.get("team"), dict) else None),
+                            (inc.get("team") or {}).get("name") if isinstance(inc.get("team"), dict) else None,
+                            to_int((inc.get("player") or {}).get("id") if isinstance(inc.get("player"), dict) else None),
+                            (inc.get("player") or {}).get("name") if isinstance(inc.get("player"), dict) else None,
+                            to_int((inc.get("relatedPlayer") or {}).get("id") if isinstance(inc.get("relatedPlayer"), dict) else None),
+                            (inc.get("relatedPlayer") or {}).get("name") if isinstance(inc.get("relatedPlayer"), dict) else None,
+                            to_int((inc.get("assist") or {}).get("id") if isinstance(inc.get("assist"), dict) else None),
+                            (inc.get("assist") or {}).get("name") if isinstance(inc.get("assist"), dict) else None,
+                            inc.get("reason"),
+                            inc.get("text"),
+                            to_float((inc.get("coordinates") or {}).get("x") if isinstance(inc.get("coordinates"), dict) else None),
+                            to_float((inc.get("coordinates") or {}).get("y") if isinstance(inc.get("coordinates"), dict) else None),
+                            1 if inc.get("inStats") is True else 0 if inc.get("inStats") is False else None,
+                            fetched_ts,
+                        ))
+                        upserted += 1
                 state["ok"] = int(state.get("ok", 0)) + 1
             elif status_code == 404:
                 state["not_found"] = int(state.get("not_found", 0)) + 1
@@ -240,20 +314,42 @@ def main() -> None:
                 state["errors"] = int(state.get("errors", 0)) + 1
                 err = f"HTTP {status_code}"
 
-            db.execute("""
-                INSERT OR REPLACE INTO incident_events
-                (event_id, status_code, incident_count, fetched_at, error)
-                VALUES (?, ?, ?, ?, ?)
-            """, (event_id, status_code, len(incidents), now_iso(), err))
+            if is_mysql:
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO sofascore_incident_events
+                    (event_id, status_code, incident_count, fetched_at, error)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE status_code=VALUES(status_code),
+                      incident_count=VALUES(incident_count), fetched_at=VALUES(fetched_at), error=VALUES(error)
+                """, (event_id, status_code, len(incidents), now_mysql(), err))
+                cur.close()
+            else:
+                db.execute("""
+                    INSERT OR REPLACE INTO incident_events
+                    (event_id, status_code, incident_count, fetched_at, error)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (event_id, status_code, len(incidents), now_iso(), err))
 
         except Exception as e:
             state["errors"] = int(state.get("errors", 0)) + 1
             err = str(e)
-            db.execute("""
-                INSERT OR REPLACE INTO incident_events
-                (event_id, status_code, incident_count, fetched_at, error)
-                VALUES (?, ?, ?, ?, ?)
-            """, (event_id, status_code, 0, now_iso(), err))
+            if is_mysql:
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO sofascore_incident_events
+                    (event_id, status_code, incident_count, fetched_at, error)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE status_code=VALUES(status_code),
+                      incident_count=VALUES(incident_count), fetched_at=VALUES(fetched_at), error=VALUES(error)
+                """, (event_id, status_code, 0, now_mysql(), err))
+                cur.close()
+            else:
+                db.execute("""
+                    INSERT OR REPLACE INTO incident_events
+                    (event_id, status_code, incident_count, fetched_at, error)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (event_id, status_code, 0, now_iso(), err))
 
         state["rows_upserted"] = int(state.get("rows_upserted", 0)) + upserted
         state["processed"] = int(state.get("processed", 0)) + 1
@@ -261,14 +357,21 @@ def main() -> None:
         processed_run += 1
 
         if processed_run % args.checkpoint_every == 0:
-            db.commit()
+            if is_mysql:
+                conn.commit()
+            else:
+                db.commit()
             save_state(state_path, state)
             pct = (processed_run / total) * 100 if total else 100
             print(f"[CHK] run={processed_run}/{total} ({pct:.2f}%) ok={state['ok']} 404={state['not_found']} err={state['errors']}")
 
         time.sleep(random.uniform(args.sleep_min, args.sleep_max))
 
-    db.commit()
+    if is_mysql:
+        conn.commit()
+    else:
+        db.commit()
+        db.close()
     save_state(state_path, state)
     print("[DONE] incidents backfill completed")
 

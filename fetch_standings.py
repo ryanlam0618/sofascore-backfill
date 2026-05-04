@@ -6,6 +6,7 @@ Uses direct API: GET /tournament/{category_id}/season/{season_id}/standings/{typ
 Types: total, home, away
 
 Resume-safe with sqlite + state JSON.
+Supports MySQL via USE_MYSQL=1 or --use-mysql flag.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+from mysql_helpers import ensure_mysql_tables, mysql_connect, use_mysql
 
 API_BASE = "https://www.sofascore.com/api/v1"
 
@@ -41,7 +44,15 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def ensure_tables(conn):
+def now_mysql():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ensure_tables(conn, is_mysql=False):
+    """Create SQLite tables (used when not using MySQL)."""
+    if is_mysql:
+        # Tables are created via ensure_mysql_tables() in main()
+        return
     conn.execute("""
         CREATE TABLE IF NOT EXISTS standings_fetch_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,12 +163,12 @@ def fetch_standings(category_id, season_id, standing_type):
             tournament_name = j.get("tournament", {}).get("name", "")
         except Exception:
             pass
-        
+
         if standing_type == "total":
             j = api_get(f"tournament/{category_id}/season/{season_id}/standings/total")
         else:
             j = api_get(f"tournament/{category_id}/season/{season_id}/standings/{standing_type}")
-        
+
         standings_list = j.get("standings", [])
         for s in standings_list:
             stype = s.get("type", standing_type.upper())
@@ -166,13 +177,63 @@ def fetch_standings(category_id, season_id, standing_type):
                 r["standing_type"] = stype
                 r["tournament_name"] = tournament_name
                 rows.append(r)
-        
+
         return (200, rows, tournament_name)
-        
+
     except urllib.error.HTTPError as e:
         return (e.code, [], tournament_name) if e.code == 404 else (404, [], tournament_name)
     except Exception:
         return (500, [], tournament_name)
+
+
+# ── MySQL upsert helpers ────────────────────────────────────────────────────
+
+def mysql_upsert_standings(conn, category_id, season_id, standing_type, tournament_name, r, fetched_ts):
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO sofascore_standings
+        (category_id, tournament_name, season_id, standing_type, position,
+         team_id, team_name, team_short_name, played, wins, draws, losses,
+         goals_for, goals_against, goal_diff, points, last_5, streak, fetched_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+          tournament_name=VALUES(tournament_name), position=VALUES(position),
+          team_name=VALUES(team_name), team_short_name=VALUES(team_short_name),
+          played=VALUES(played), wins=VALUES(wins), draws=VALUES(draws),
+          losses=VALUES(losses), goals_for=VALUES(goals_for), goals_against=VALUES(goals_against),
+          goal_diff=VALUES(goal_diff), points=VALUES(points), last_5=VALUES(last_5),
+          streak=VALUES(streak), fetched_at=VALUES(fetched_at)
+    """, (
+        category_id, r.get("tournament_name", tournament_name), season_id,
+        r.get("standing_type", standing_type),
+        to_int(r.get("position")),
+        to_int(r.get("team_id")),
+        r.get("team_name", ""),
+        r.get("team_short_name", ""),
+        to_int(r.get("played")),
+        to_int(r.get("wins")),
+        to_int(r.get("draws")),
+        to_int(r.get("losses")),
+        to_int(r.get("goals_for")),
+        to_int(r.get("goals_against")),
+        to_int(r.get("goal_diff")),
+        to_int(r.get("points")),
+        r.get("last_5", ""),
+        r.get("streak", ""),
+        fetched_ts,
+    ))
+    cur.close()
+
+
+def mysql_log_standings(conn, category_id, season_id, standing_type, tournament_name, fetched_ts, status_code, local_rows, err):
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO sofascore_standings_fetch_log
+        (category_id, season_id, standing_type, tournament_name, fetched_at, status_code, row_count, error)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE fetched_at=VALUES(fetched_at)
+    """, (category_id, season_id, standing_type, tournament_name, fetched_ts, status_code, local_rows, err))
+    cur.close()
 
 
 def main():
@@ -184,19 +245,29 @@ def main():
     ap.add_argument("--category-id", type=int, nargs="+", default=[])
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--use-mysql", action="store_true",
+                    help="Write to MySQL instead of SQLite")
     args = ap.parse_args()
 
-    db = sqlite3.connect(args.db)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA busy_timeout=60000")
-    ensure_tables(db)
+    is_mysql = args.use_mysql or use_mysql()
+
+    if is_mysql:
+        conn = mysql_connect()
+        ensure_mysql_tables(conn)
+        print(f"[INFO] Using MySQL (database: appdb)")
+    else:
+        conn = sqlite3.connect(args.db)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=60000")
+        ensure_tables(conn, is_mysql=False)
+        print(f"[INFO] Using SQLite: {args.db}")
 
     state_path = Path(args.state)
     state = load_state(state_path)
 
     targets = []
     standing_types = ["total", "home", "away"]
-    
+
     if args.category_id:
         cat_ids = args.category_id
     elif args.all:
@@ -232,36 +303,44 @@ def main():
                 status_code = 404
             else:
                 status_code, rows, tournament_name = fetch_standings(category_id, season_id, standing_type)
-                
+
                 if status_code == 200 and rows:
-                    for r in rows:
-                        db.execute("""
-                            INSERT OR REPLACE INTO standings
-                            (category_id, tournament_name, season_id, standing_type, position,
-                             team_id, team_name, team_short_name, played, wins, draws, losses,
-                             goals_for, goals_against, goal_diff, points, last_5, streak, fetched_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            category_id, r.get("tournament_name", ""), season_id,
-                            r.get("standing_type", standing_type),
-                            to_int(r.get("position")),
-                            to_int(r.get("team_id")),
-                            r.get("team_name", ""),
-                            r.get("team_short_name", ""),
-                            to_int(r.get("played")),
-                            to_int(r.get("wins")),
-                            to_int(r.get("draws")),
-                            to_int(r.get("losses")),
-                            to_int(r.get("goals_for")),
-                            to_int(r.get("goals_against")),
-                            to_int(r.get("goal_diff")),
-                            to_int(r.get("points")),
-                            r.get("last_5", ""),
-                            r.get("streak", ""),
-                            now_iso(),
-                        ))
-                        local_rows += 1
-                        rows_upserted += 1
+                    fetched_ts = now_mysql() if is_mysql else now_iso()
+
+                    if is_mysql:
+                        for r in rows:
+                            mysql_upsert_standings(conn, category_id, season_id, standing_type, tournament_name, r, fetched_ts)
+                            local_rows += 1
+                            rows_upserted += 1
+                    else:
+                        for r in rows:
+                            conn.execute("""
+                                INSERT OR REPLACE INTO standings
+                                (category_id, tournament_name, season_id, standing_type, position,
+                                 team_id, team_name, team_short_name, played, wins, draws, losses,
+                                 goals_for, goals_against, goal_diff, points, last_5, streak, fetched_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                category_id, r.get("tournament_name", ""), season_id,
+                                r.get("standing_type", standing_type),
+                                to_int(r.get("position")),
+                                to_int(r.get("team_id")),
+                                r.get("team_name", ""),
+                                r.get("team_short_name", ""),
+                                to_int(r.get("played")),
+                                to_int(r.get("wins")),
+                                to_int(r.get("draws")),
+                                to_int(r.get("losses")),
+                                to_int(r.get("goals_for")),
+                                to_int(r.get("goals_against")),
+                                to_int(r.get("goal_diff")),
+                                to_int(r.get("points")),
+                                r.get("last_5", ""),
+                                r.get("streak", ""),
+                                fetched_ts,
+                            ))
+                            local_rows += 1
+                            rows_upserted += 1
                     state["ok"] += 1
                     state["standings_rows"] += local_rows
                 elif status_code == 404:
@@ -274,23 +353,33 @@ def main():
             state["errors"] += 1
             err = str(e)
 
-        db.execute("""
-            INSERT INTO standings_fetch_log
-            (category_id, season_id, standing_type, tournament_name, fetched_at, status_code, row_count, error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (category_id, season_id, standing_type, tournament_name, now_iso(), status_code, local_rows, err))
+        if is_mysql:
+            mysql_log_standings(conn, category_id, season_id, standing_type, tournament_name, now_mysql(), status_code, local_rows, err)
+        else:
+            conn.execute("""
+                INSERT INTO standings_fetch_log
+                (category_id, season_id, standing_type, tournament_name, fetched_at, status_code, row_count, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (category_id, season_id, standing_type, tournament_name, now_iso(), status_code, local_rows, err))
 
         state["processed"] += 1
 
         if state["processed"] % 20 == 0:
-            db.commit()
+            if is_mysql:
+                conn.commit()
+            else:
+                db.commit()
             save_state(state_path, state)
             pct = (state["processed"] / total) * 100
             print(f"[CHK] {state['processed']}/{total} ({pct:.0f}%) ok={state['ok']} 404={state['not_found']} err={state['errors']}")
 
         time.sleep(random.uniform(args.sleep_min, args.sleep_max))
 
-    db.commit()
+    if is_mysql:
+        conn.commit()
+    else:
+        conn.commit()
+        conn.close()
     save_state(state_path, state)
     print(f"[DONE] standings: {rows_upserted} rows, ok={state['ok']}, 404={state['not_found']}, err={state['errors']}")
 

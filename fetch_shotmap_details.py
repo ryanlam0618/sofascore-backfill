@@ -8,6 +8,9 @@ Backfill detailed shotmap rows (resume-safe) via direct API.
 
 API: GET https://www.sofascore.com/api/v1/event/{event_id}/shotmap
 Status: ✅ Direct API confirmed working (2026-05-03)
+
+Supports MySQL via USE_MYSQL=1 or --use-mysql flag.
+Resume-safe with sqlite + state JSON.
 """
 
 from __future__ import annotations
@@ -20,6 +23,8 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+from mysql_helpers import ensure_mysql_tables, mysql_connect, use_mysql
 
 API_BASE = "https://www.sofascore.com/api/v1"
 
@@ -40,6 +45,10 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def now_mysql() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def load_state(path: Path) -> dict:
     if not path.exists():
         return {
@@ -56,7 +65,10 @@ def save_state(path: Path, state: dict) -> None:
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def ensure_tables(conn: sqlite3.Connection) -> None:
+def ensure_tables(conn: sqlite3.Connection | None = None, mysql_conn=None) -> None:
+    """Create SQLite tables. MySQL tables created via ensure_mysql_tables()."""
+    if conn is None:
+        return
     conn.execute("""
         CREATE TABLE IF NOT EXISTS shotmap_detail_events (
           event_id INTEGER PRIMARY KEY,
@@ -121,34 +133,54 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--source-db", default="data/backfill_sofascore_10y/shotmap_xg.sqlite",
                     help="DB with shotmap_xg_backfill table to read event_ids from")
+    ap.add_argument("--use-mysql", action="store_true", help="Write to MySQL instead of SQLite")
     args = ap.parse_args()
 
-    db = sqlite3.connect(args.db)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA busy_timeout=60000")
-    ensure_tables(db)
+    is_mysql = args.use_mysql or use_mysql()
+
+    if is_mysql:
+        conn = mysql_connect()
+        ensure_mysql_tables(conn)
+        print(f"[INFO] Using MySQL (database: appdb)")
+        db = None  # type: ignore
+    else:
+        db = sqlite3.connect(args.db)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA busy_timeout=60000")
+        ensure_tables(conn=db)
+        conn = db
+        print(f"[INFO] Using SQLite: {args.db}")
 
     state_path = Path(args.state)
     state = load_state(state_path)
 
     # Get event IDs from source shotmap DB
     try:
-        src_db = sqlite3.connect(args.source_db)
-        src_db.row_factory = sqlite3.Row
-        done_ids = set(r[0] for r in db.execute("SELECT event_id FROM shotmap_detail_events").fetchall())
-        rows = src_db.execute(
-            "SELECT event_id FROM shotmap_xg_backfill WHERE has_shotmap=1"
-        ).fetchall()
-        rows = [r for r in rows if int(r["event_id"]) not in done_ids]
-        src_db.close()
+        if is_mysql:
+            # Read from MySQL source table
+            cur = conn.cursor(dictionary=True)
+            cur.execute("SELECT event_id FROM sofascore_shotmap_xg_backfill WHERE has_shotmap=1")
+            all_rows = cur.fetchall()
+            cur.close()
+            # MySQL dedup by ON DUPLICATE KEY
+            targets = [(int(r["event_id"]),) for r in all_rows]
+        else:
+            src_db = sqlite3.connect(args.source_db)
+            src_db.row_factory = sqlite3.Row
+            done_ids = set(r[0] for r in db.execute("SELECT event_id FROM shotmap_detail_events").fetchall())
+            rows = src_db.execute(
+                "SELECT event_id FROM shotmap_xg_backfill WHERE has_shotmap=1"
+            ).fetchall()
+            targets = [r for r in rows if int(r["event_id"]) not in done_ids]
+            src_db.close()
     except Exception as e:
         print(f"[ERROR] Could not read source DB: {e}")
-        rows = []
+        targets = []
 
     if args.limit and args.limit > 0:
-        rows = rows[:args.limit]
+        targets = targets[:args.limit]
 
-    total = len(rows)
+    total = len(targets)
     state["total_targets"] = total
     save_state(state_path, state)
     print(f"[INFO] targets={total}")
@@ -159,8 +191,8 @@ def main() -> None:
 
     processed_run = 0
 
-    for r in rows:
-        event_id = int(r["event_id"])
+    for row_data in targets:
+        event_id = int(row_data[0]) if isinstance(row_data, tuple) else int(row_data["event_id"])
         status_code = 0
         err = ""
         upserted = 0
@@ -174,42 +206,96 @@ def main() -> None:
                     player_info = sh.get("player", {})
                     team_info = sh.get("team", {})
                     coords = sh.get("playerCoordinates", {}) or sh.get("coordinates", {})
-                    db.execute("""
-                        INSERT OR REPLACE INTO shotmap_details
-                        (event_id, shot_id, is_home_shot,
-                         team_id, team_name,
-                         player_id, player_name, player_position,
-                         minute, added_time, time_seconds,
-                         incident_type, shot_type, situation, body_part, goal_mouth_location,
-                         player_x, player_y, xg,
-                         home_team_goal_prob, away_team_goal_prob,
-                         fetched_at, error)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        event_id,
-                        to_int(sh.get("id")),
-                        1 if sh.get("isHome") is True else 0 if sh.get("isHome") is False else None,
-                        to_int(team_info.get("id") if isinstance(team_info, dict) else None),
-                        team_info.get("name") if isinstance(team_info, dict) else None,
-                        to_int(player_info.get("id") if isinstance(player_info, dict) else None),
-                        player_info.get("name") if isinstance(player_info, dict) else None,
-                        player_info.get("position") if isinstance(player_info, dict) else None,
-                        to_int(sh.get("time")),
-                        to_int(sh.get("addedTime")),
-                        to_int(sh.get("timeSeconds")),
-                        sh.get("incidentType"),
-                        sh.get("shotType"),
-                        sh.get("situation"),
-                        sh.get("bodyPart"),
-                        sh.get("goalMouthLocation"),
-                        to_float(coords.get("x") if isinstance(coords, dict) else None),
-                        to_float(coords.get("y") if isinstance(coords, dict) else None),
-                        to_float(sh.get("xg")),
-                        to_float(sh.get("homeTeamGoalProbability")),
-                        to_float(sh.get("awayTeamGoalProbability")),
-                        now_iso(),
-                        "",
-                    ))
+                    fetched_ts = now_mysql() if is_mysql else now_iso()
+
+                    if is_mysql:
+                        cur = conn.cursor()
+                        cur.execute("""
+                            INSERT INTO sofascore_shotmap_details
+                            (event_id, shot_id, is_home_shot,
+                             team_id, team_name,
+                             player_id, player_name, player_position,
+                             minute, added_time, time_seconds,
+                             incident_type, shot_type, situation, body_part, goal_mouth_location,
+                             player_x, player_y, xg,
+                             home_team_goal_prob, away_team_goal_prob,
+                             fetched_at, error)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON DUPLICATE KEY UPDATE
+                              is_home_shot=VALUES(is_home_shot), team_id=VALUES(team_id),
+                              team_name=VALUES(team_name), player_id=VALUES(player_id),
+                              player_name=VALUES(player_name), player_position=VALUES(player_position),
+                              minute=VALUES(minute), added_time=VALUES(added_time),
+                              time_seconds=VALUES(time_seconds), incident_type=VALUES(incident_type),
+                              shot_type=VALUES(shot_type), situation=VALUES(situation),
+                              body_part=VALUES(body_part), goal_mouth_location=VALUES(goal_mouth_location),
+                              player_x=VALUES(player_x), player_y=VALUES(player_y),
+                              xg=VALUES(xg), home_team_goal_prob=VALUES(home_team_goal_prob),
+                              away_team_goal_prob=VALUES(away_team_goal_prob),
+                              fetched_at=VALUES(fetched_at), error=VALUES(error)
+                        """, (
+                            event_id,
+                            to_int(sh.get("id")),
+                            1 if sh.get("isHome") is True else 0 if sh.get("isHome") is False else None,
+                            to_int(team_info.get("id") if isinstance(team_info, dict) else None),
+                            team_info.get("name") if isinstance(team_info, dict) else None,
+                            to_int(player_info.get("id") if isinstance(player_info, dict) else None),
+                            player_info.get("name") if isinstance(player_info, dict) else None,
+                            player_info.get("position") if isinstance(player_info, dict) else None,
+                            to_int(sh.get("time")),
+                            to_int(sh.get("addedTime")),
+                            to_int(sh.get("timeSeconds")),
+                            sh.get("incidentType"),
+                            sh.get("shotType"),
+                            sh.get("situation"),
+                            sh.get("bodyPart"),
+                            sh.get("goalMouthLocation"),
+                            to_float(coords.get("x") if isinstance(coords, dict) else None),
+                            to_float(coords.get("y") if isinstance(coords, dict) else None),
+                            to_float(sh.get("xg")),
+                            to_float(sh.get("homeTeamGoalProbability")),
+                            to_float(sh.get("awayTeamGoalProbability")),
+                            fetched_ts,
+                            "",
+                        ))
+                        cur.close()
+                    else:
+                        conn.execute("""
+                            INSERT OR REPLACE INTO shotmap_details
+                            (event_id, shot_id, is_home_shot,
+                             team_id, team_name,
+                             player_id, player_name, player_position,
+                             minute, added_time, time_seconds,
+                             incident_type, shot_type, situation, body_part, goal_mouth_location,
+                             player_x, player_y, xg,
+                             home_team_goal_prob, away_team_goal_prob,
+                             fetched_at, error)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            event_id,
+                            to_int(sh.get("id")),
+                            1 if sh.get("isHome") is True else 0 if sh.get("isHome") is False else None,
+                            to_int(team_info.get("id") if isinstance(team_info, dict) else None),
+                            team_info.get("name") if isinstance(team_info, dict) else None,
+                            to_int(player_info.get("id") if isinstance(player_info, dict) else None),
+                            player_info.get("name") if isinstance(player_info, dict) else None,
+                            player_info.get("position") if isinstance(player_info, dict) else None,
+                            to_int(sh.get("time")),
+                            to_int(sh.get("addedTime")),
+                            to_int(sh.get("timeSeconds")),
+                            sh.get("incidentType"),
+                            sh.get("shotType"),
+                            sh.get("situation"),
+                            sh.get("bodyPart"),
+                            sh.get("goalMouthLocation"),
+                            to_float(coords.get("x") if isinstance(coords, dict) else None),
+                            to_float(coords.get("y") if isinstance(coords, dict) else None),
+                            to_float(sh.get("xg")),
+                            to_float(sh.get("homeTeamGoalProbability")),
+                            to_float(sh.get("awayTeamGoalProbability")),
+                            fetched_ts,
+                            "",
+                        ))
                     upserted += 1
                 state["ok"] = int(state.get("ok", 0)) + 1
             elif status_code == 404:
@@ -218,20 +304,42 @@ def main() -> None:
                 state["errors"] = int(state.get("errors", 0)) + 1
                 err = f"HTTP {status_code}"
 
-            db.execute("""
-                INSERT OR REPLACE INTO shotmap_detail_events
-                (event_id, status_code, shot_count, fetched_at, error)
-                VALUES (?, ?, ?, ?, ?)
-            """, (event_id, status_code, len(shots), now_iso(), err))
+            if is_mysql:
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO sofascore_shotmap_detail_events
+                    (event_id, status_code, shot_count, fetched_at, error)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE status_code=VALUES(status_code),
+                      shot_count=VALUES(shot_count), fetched_at=VALUES(fetched_at), error=VALUES(error)
+                """, (event_id, status_code, len(shots), now_mysql(), err))
+                cur.close()
+            else:
+                conn.execute("""
+                    INSERT OR REPLACE INTO shotmap_detail_events
+                    (event_id, status_code, shot_count, fetched_at, error)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (event_id, status_code, len(shots), now_iso(), err))
 
         except Exception as e:
             state["errors"] = int(state.get("errors", 0)) + 1
             err = str(e)
-            db.execute("""
-                INSERT OR REPLACE INTO shotmap_detail_events
-                (event_id, status_code, shot_count, fetched_at, error)
-                VALUES (?, ?, ?, ?, ?)
-            """, (event_id, status_code, 0, now_iso(), err))
+            if is_mysql:
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO sofascore_shotmap_detail_events
+                    (event_id, status_code, shot_count, fetched_at, error)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE status_code=VALUES(status_code),
+                      fetched_at=VALUES(fetched_at), error=VALUES(error)
+                """, (event_id, status_code, 0, now_mysql(), err))
+                cur.close()
+            else:
+                conn.execute("""
+                    INSERT OR REPLACE INTO shotmap_detail_events
+                    (event_id, status_code, shot_count, fetched_at, error)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (event_id, status_code, 0, now_iso(), err))
 
         state["rows_upserted"] = int(state.get("rows_upserted", 0)) + upserted
         state["processed"] = int(state.get("processed", 0)) + 1
@@ -239,7 +347,10 @@ def main() -> None:
         processed_run += 1
 
         if processed_run % args.checkpoint_every == 0:
-            db.commit()
+            if is_mysql:
+                conn.commit()
+            else:
+                conn.commit()
             save_state(state_path, state)
             pct = (processed_run / total) * 100 if total else 100
             print(f"[CHK] run={processed_run}/{total} ({pct:.2f}%) "
@@ -248,7 +359,11 @@ def main() -> None:
 
         time.sleep(random.uniform(args.sleep_min, args.sleep_max))
 
-    db.commit()
+    if is_mysql:
+        conn.commit()
+    else:
+        conn.commit()
+        conn.close()
     save_state(state_path, state)
     print("[DONE] shotmap_details completed")
 

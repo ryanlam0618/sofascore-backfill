@@ -75,7 +75,7 @@ COMPETITION_MAPPING = {
     "Premier League": {
         "cat_id": 1,
         "ut_id": 17,
-        "confirmed_sids": {61627: "2024/25"},  # CONFIRMED ✅
+        "confirmed_sids": {10356: "15/16", 11733: "16/17", 13380: "17/18", 17359: "18/19", 23776: "19/20", 29415: "20/21", 37036: "21/22", 41886: "22/23", 52186: "23/24", 61627: "24/25", 76986: "25/26"},  # 2015-16 to 2025-26 ✅
         "needs_discovery": False,
     },
     "La Liga": {
@@ -321,7 +321,8 @@ def load_competition_config() -> dict:
 # ── Backfill Logic ────────────────────────────────────────────────────────────
 
 def backfill_competition(competition: str, dry_run: bool = False,
-                        limit_per_script: int = 0) -> dict:
+                        limit_per_script: int = 0,
+                        from_year: int = 2015) -> dict:
     """
     Backfill one competition's 10-year data.
     Scripts: incidents, lineups, shotmap_xg, shotmap_details (depends on shotmap_xg).
@@ -351,18 +352,42 @@ def backfill_competition(competition: str, dry_run: bool = False,
     cat_id = cfg["cat_id"]
     ut_id = cfg["ut_id"]
 
-    # ── Discover season IDs from discoveries.json ────────────────────────
+    # Filter to 2015-16 onwards (configurable via --from-year)
+    def season_year(slug: str) -> int:
+        """Extract start year from slug for filtering.
+        
+        Format examples:
+        - European: '15/16' -> 2015, '99/00' -> 1999, '02/03' -> 2002
+        - Asian:    '2015' -> 2015, '2008' -> 2008
+        """
+        import re
+        # European: '15/16' or '99/00'
+        m = re.match(r'^(\d{2})/(\d{2})$', slug)
+        if m:
+            yy = int(m.group(1))  # first 2 digits
+            # < 50 -> 20xx (e.g. '15' -> 2015), >= 50 -> 19xx (e.g. '99' -> 1999)
+            return 2000 + yy if yy < 50 else 1900 + yy
+        # Asian: '2015' or '2008'
+        m = re.match(r'^(\d{4})', slug)
+        if m:
+            return int(m.group(1))
+        return 0
+
     if cfg["needs_discovery"] or not cfg["confirmed_sids"]:
         discoveries = load_discoveries()
         disc = discoveries.get(competition, {})
         seasons = disc.get("seasons", {})
         # discoveries.json format: {sid_str: year_str}
+        # Filter to from_year (default 2015)
         season_ids_to_process = sorted(
-            int(k) for k in seasons.keys()
-            if k is not None
+            int(k) for k, v in seasons.items()
+            if k is not None and season_year(v) >= from_year
         )
     else:
-        season_ids_to_process = sorted(cfg["confirmed_sids"].keys())
+        # confirmed_sids: filter by from_year
+        cfg_seasons = cfg.get("confirmed_sids", {})
+        season_ids_to_process = sorted(k for k in cfg_seasons.keys()
+                                        if season_year(cfg_seasons[k]) >= from_year)
 
     if not season_ids_to_process:
         return {
@@ -635,6 +660,8 @@ def main() -> None:
                     help="Show what would run without executing")
     ap.add_argument("--limit", type=int, default=0,
                     help="Limit events per script (0=unlimited)")
+    ap.add_argument("--from-year", type=int, default=2015,
+                    help="Only process seasons from this year onwards (default: 2015)")
     ap.add_argument("--only-confirmed", action="store_true",
                     help="Only run competitions with confirmed season IDs")
 
@@ -675,6 +702,7 @@ def main() -> None:
             args.competition,
             dry_run=args.dry_run,
             limit_per_script=args.limit,
+            from_year=args.from_year,
         )
         print(f"Result: {json.dumps(result, indent=2)}")
         return
@@ -714,6 +742,7 @@ def main() -> None:
                 comp,
                 dry_run=args.dry_run,
                 limit_per_script=args.limit,
+                from_year=args.from_year,
             )
             for script, res in result.items():
                 if isinstance(res, dict):

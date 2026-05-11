@@ -348,7 +348,7 @@ def _filter_cmd(cmd: list, script: str) -> list:
     """
     Return a cmd list containing only flags that |script| accepts.
     cmd is a flat list like ["--db", "x.db", "--checkpoint-every", "50", ...]
-    Flags not in SCRIPT_ARG_MAP[script] are dropped.
+    Flags not in SCRIPT_ARG_MAP[script] are dropped. Also skip their values.
     """
     supported = SCRIPT_ARG_MAP.get(script, frozenset())
     filtered = []
@@ -363,7 +363,10 @@ def _filter_cmd(cmd: list, script: str) -> list:
                 if i + 1 < len(cmd) and not cmd[i + 1].startswith("--"):
                     filtered.append(cmd[i + 1])
                     i += 1
-            # else: flag not supported, skip it and its value if present
+            else:
+                # unsupported flag — also skip its value
+                if i + 1 < len(cmd) and not cmd[i + 1].startswith("--"):
+                    i += 1
         else:
             filtered.append(arg)
         i += 1

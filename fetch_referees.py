@@ -16,11 +16,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sqlite3
 import time
 import urllib.request
-import urllib.error
 import urllib.error
 
 _proxy_opener = None

@@ -21,6 +21,30 @@ import random
 import sqlite3
 import time
 import urllib.request
+import urllib.error
+import urllib.error
+
+_proxy_opener = None
+
+def _get_opener():
+    global _proxy_opener
+    if _proxy_opener is None:
+        # Load from .env if available
+        env_path = "/root/.openclaw/workspace/.env"
+        env = {}
+        if os.path.exists(env_path):
+            for line in open(env_path):
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip()
+        proxy = os.environ.get("SOFA_PROXY") or env.get("SOFA_PROXY", "")
+        if proxy:
+            ph = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        else:
+            ph = urllib.request.ProxyHandler({})
+        _proxy_opener = urllib.request.build_opener(ph)
+    return _proxy_opener
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,7 +57,7 @@ def api_get(path: str) -> tuple[int, dict]:
     url = f"{API_BASE}/{path.lstrip('/')}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with _get_opener().open(req, timeout=15) as resp:
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return e.code, {}

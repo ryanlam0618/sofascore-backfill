@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sqlite3
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +25,21 @@ from pathlib import Path
 from mysql_helpers import ensure_mysql_tables, mysql_connect, use_mysql
 
 API_BASE = "https://www.sofascore.com/api/v1"
+
+_proxy_opener = None
+
+
+def _get_opener():
+    global _proxy_opener
+    if _proxy_opener is None:
+        proxy = os.environ.get("SOFA_PROXY", "")
+        if proxy:
+            ph = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        else:
+            ph = urllib.request.ProxyHandler({})
+        _proxy_opener = urllib.request.build_opener(ph)
+    return _proxy_opener
+
 
 TOURNAMENT_IDS = {
     "premier-league": 1, "championship": 2, "laliga": 8, "la-liga": 8,
@@ -117,16 +134,24 @@ def to_int(v, default=0):
 
 def api_get(path):
     url = f"{API_BASE}/{path.lstrip('/')}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    resp = urllib.request.urlopen(req, timeout=15)
-    return json.loads(resp.read())
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with _get_opener().open(req, timeout=15) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        raise
+    except Exception as e:
+        raise
 
 
 def get_season_id(category_id):
     try:
         j = api_get(f"tournament/{category_id}/seasons")
         seasons = j.get("seasons", [])
-        if seasons:
+        if seasons and len(seasons) > 0:
             return seasons[0]["id"]
     except Exception:
         pass

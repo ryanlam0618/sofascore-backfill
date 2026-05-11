@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fetch team rankings from SofaScore.
+Fetch team world/regional rankings from SofaScore team page HTML __NEXT_DATA__.
 
-NOTE: Team world/regional rankings do NOT have a public API endpoint.
-The /rankings/team/{type} endpoint returns 404.
-Team rankings shown on SofaScore web are rendered client-side via JavaScript.
+Approach: SofaScore team web pages embed a `__NEXT_DATA__` hydration script
+containing all server-side rendered data, including historical team rankings
+under `props.pageProps.initialProps.teamRankings.rankings`.
 
-Options:
-1. Use DrissionPage browser automation (requires significant memory)
-2. Use paid data providers (e.g., API-Football, Football-Data.org)
-3. Scrape via headless Chrome with CDP
+Direct API ranking endpoints (/rankings/team/*) all return 404 — the data
+is only available via HTML page hydration.
 
-For now, this script attempts direct API patterns but gracefully falls back
-when rankings endpoints return 404.
+Endpoint: GET https://www.sofascore.com/team/football/{slug}/{team_id}
+Returns: HTML page with __NEXT_DATA__ → props.pageProps.initialProps.teamRankings
 
-Resume-safe with sqlite + state JSON.
+Ranking types embedded in the page (integer `type` values):
+  4  = European / UEFA ranking
+  9  = World ranking (default shown on page)
+  10 = Home ranking (if applicable)
+  11 = Away ranking (if applicable)
+
+Data fields per row: year, type, ranking, points, team, rowName, id, rankingClass
+
+Resume-safe with sqlite + state JSON. Also supports MySQL via --use-mysql.
 """
 
 from __future__ import annotations
@@ -23,275 +29,374 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import sqlite3
 import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-API_BASE = "https://www.sofascore.com/api/v1"
+from mysql_helpers import ensure_mysql_tables, mysql_connect, use_mysql
 
-# Known ranking types
-RANKING_TYPES = ["overall", "attack", "defense", "goalkeeping"]
-
-# Team ranking endpoints we tested (all return 404)
-# /rankings/team/{type}
-# /tournament/{id}/season/{id}/rankings
-# /unique-tournament/{id}/season/{id}/rankings
-# /rankings/team/world
-
-CAT_TO_UT = {
-    1: 17, 2: 18, 3: 24, 8: 8, 23: 23, 9: 9, 4: 34,
-    7: 7, 459: 459, 94: 94, 245: 245, 314: 314,
-}
+TEAM_PAGE_BASE = "https://www.sofascore.com"
 
 
-def now_iso():
+def fetch_team_page_html(team_id: int, slug: str = "", retries: int = 3,
+                          backoff_base: float = 1.5) -> tuple[int, str]:
+    """Fetch the team web page as HTML. Returns (status_code, html_or_empty)."""
+    # Build URL — slug is optional for the endpoint
+    if slug:
+        url = f"{TEAM_PAGE_BASE}/team/football/{slug}/{team_id}"
+    else:
+        url = f"{TEAM_PAGE_BASE}/team/football/team/{team_id}"
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9",
+        "Accept-Language": "en-GB,en;q=0.9,en;q=0.8",
+        "Accept-Encoding": "identity",
+        "Referer": "https://www.sofascore.com/",
+    }
+    last_status = 500
+    for attempt in range(retries):
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return resp.status, resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            last_status = e.code
+            if e.code in (404, 410) and attempt < retries - 1:
+                time.sleep(backoff_base * (attempt + 1) + random.uniform(0.3, 1.0))
+                continue
+            if e.code == 403 and attempt < retries - 1:
+                time.sleep(backoff_base * (attempt + 1) + random.uniform(0.3, 1.0))
+                continue
+            return e.code, ""
+        except Exception:
+            last_status = 500
+            if attempt < retries - 1:
+                time.sleep(backoff_base * (attempt + 1) + random.uniform(0.3, 1.0))
+                continue
+            return 500, ""
+    return last_status, ""
+
+
+def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def ensure_tables(conn):
+def now_mysql() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ── SQLite schema ─────────────────────────────────────────────────────────────
+
+def ensure_tables_sqlite(conn: sqlite3.Connection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS team_ranking_fetch_log (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          ranking_type TEXT,
-          category_id INTEGER,
-          fetched_at TEXT,
-          status_code INTEGER,
-          team_count INTEGER,
-          error TEXT
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id INTEGER,
+            team_slug TEXT,
+            fetched_at TEXT,
+            status_code INTEGER,
+            row_count INTEGER,
+            ranking_types TEXT,
+            error TEXT
         )
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS team_rankings (
-          category_id INTEGER,
-          ranking_type TEXT,
-          rank INTEGER,
-          team_id INTEGER,
-          team_name TEXT,
-          team_short_name TEXT,
-          value REAL,
-          value_str TEXT,
-          trend TEXT,
-          tournament_name TEXT,
-          fetched_at TEXT,
-          UNIQUE(category_id, ranking_type, team_id)
+            team_id INTEGER,
+            team_name TEXT,
+            team_slug TEXT,
+            year TEXT,
+            ranking_type INTEGER,
+            ranking_type_name TEXT,
+            ranking INTEGER,
+            points INTEGER,
+            ranking_class TEXT,
+            fetched_at TEXT,
+            UNIQUE(team_id, year, ranking_type)
         )
     """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_rank ON team_rankings(category_id, ranking_type)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tr_team ON team_rankings(team_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tr_year ON team_rankings(year)")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=60000")
     conn.commit()
 
 
-def load_state(path):
+# ── Ranking type mapping ───────────────────────────────────────────────────────
+
+RANKING_TYPE_NAMES = {
+    4:  "uefa",
+    9:  "world",
+    10: "home",
+    11: "away",
+}
+
+
+def parse_team_page(html: str) -> tuple[list[dict], dict]:
+    """
+    Extract team rankings from the __NEXT_DATA__ hydration script.
+    Returns (rankings_rows, team_meta_dict).
+    """
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+    if not m:
+        return [], {}
+    try:
+        data = json.loads(m.group(1))
+        pp = data.get("props", {}).get("pageProps", {})
+        ip = pp.get("initialProps", {})
+        rankings_raw = ip.get("teamRankings", {})
+        rankings_rows = rankings_raw.get("rankings", []) if isinstance(rankings_raw, dict) else rankings_raw or []
+        team_meta = ip.get("team", {})
+        return rankings_rows, team_meta
+    except Exception:
+        return [], {}
+
+
+def normalize_ranking_row(row: dict) -> dict:
+    """Normalize a single ranking row to a flat dict."""
+    team_block = row.get("team", {}) or {}
+    ranking_type = int(row.get("type", 0))
+    return {
+        "team_id":     int(team_block.get("id", 0) or row.get("teamId", 0) or 0),
+        "team_name":   team_block.get("name", "") or row.get("rowName", ""),
+        "team_slug":   team_block.get("slug", ""),
+        "year":        str(row.get("year", "")),
+        "ranking_type": ranking_type,
+        "ranking_type_name": RANKING_TYPE_NAMES.get(ranking_type, str(ranking_type)),
+        "ranking":     int(row.get("ranking", 0) or 0),
+        "points":      int(row.get("points", 0) or 0),
+        "ranking_class": str(row.get("rankingClass", "")),
+    }
+
+
+def upsert_ranking_sqlite(db, row: dict, fetched_at: str) -> None:
+    db.execute("""
+        INSERT OR REPLACE INTO team_rankings
+        (team_id, team_name, team_slug, year, ranking_type, ranking_type_name,
+         ranking, points, ranking_class, fetched_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        row["team_id"], row["team_name"], row["team_slug"],
+        row["year"], row["ranking_type"], row["ranking_type_name"],
+        row["ranking"], row["points"], row["ranking_class"],
+        fetched_at,
+    ))
+
+
+def upsert_ranking_mysql(conn, row: dict, fetched_at: str) -> None:
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO sofascore_team_rankings
+        (team_id, team_name, team_slug, year, ranking_type, ranking_type_name,
+         ranking, points, ranking_class, fetched_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+          team_name=VALUES(team_name), team_slug=VALUES(team_slug),
+          ranking=VALUES(ranking), points=VALUES(points),
+          ranking_class=VALUES(ranking_class), fetched_at=VALUES(fetched_at)
+    """, (
+        row["team_id"], row["team_name"], row["team_slug"],
+        row["year"], row["ranking_type"], row["ranking_type_name"],
+        row["ranking"], row["points"], row["ranking_class"],
+        fetched_at,
+    ))
+    cur.close()
+
+
+# ── State management ──────────────────────────────────────────────────────────
+
+def load_state(path: Path) -> dict:
     if not path.exists():
-        return {"started_at": now_iso(), "updated_at": now_iso(),
-                "processed": 0, "ok": 0, "not_found": 0, "errors": 0,
-                "ranking_rows": 0, "last_category_id": None, "total_targets": 0}
+        return {
+            "started_at": now_iso(), "updated_at": now_iso(),
+            "processed": 0, "ok": 0, "not_found": 0, "errors": 0,
+            "rows_upserted": 0, "last_team_id": None, "total_targets": 0,
+        }
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def save_state(path, state):
+def save_state(path: Path, state: dict) -> None:
     state["updated_at"] = now_iso()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def to_int(v, default=0):
-    try:
-        return int(float(v))
-    except (TypeError, ValueError):
-        return default
+# ── Main ──────────────────────────────────────────────────────────────────────
 
-
-def to_float(v, default=0.0):
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return default
-
-
-def api_get(path):
-    url = f"{API_BASE}/{path.lstrip('/')}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    resp = urllib.request.urlopen(req, timeout=15)
-    return json.loads(resp.read())
-
-
-def get_season_id(ut_id):
-    try:
-        j = api_get(f"unique-tournament/{ut_id}/seasons")
-        seasons = j.get("seasons", [])
-        if seasons:
-            return seasons[0]["id"]
-    except Exception:
-        pass
-    return 0
-
-
-def fetch_rankings(category_id, ranking_type):
-    """Try direct API patterns for team rankings.
-    
-    All tested patterns return 404. This function attempts common
-    patterns and returns empty results when none work.
-    
-    Future: Use browser automation to extract from web page if needed.
-    """
-    rows = []
-    tournament_name = ""
-    
-    try:
-        # Get tournament name
-        try:
-            j = api_get(f"tournament/{category_id}")
-            tournament_name = j.get("tournament", {}).get("name", "")
-        except Exception:
-            pass
-        
-        # Try various ranking endpoint patterns
-        patterns = [
-            f"rankings/team/{ranking_type}",
-            f"tournament/{category_id}/season/current/rankings/{ranking_type}",
-            f"tournament/{category_id}/rankings/{ranking_type}",
-            f"unique-tournament/{CAT_TO_UT.get(category_id, category_id)}/rankings/{ranking_type}",
-            f"rankings/{ranking_type}",
-        ]
-        
-        for path in patterns:
-            try:
-                j = api_get(path)
-                # If we get here, the endpoint exists
-                if j and "error" not in j:
-                    # Try to parse rankings from response
-                    ranking_data = j if isinstance(j, list) else j.get("rankings") or j.get("standings") or j.get("data") or []
-                    if isinstance(ranking_data, list):
-                        for item in ranking_data:
-                            if isinstance(item, dict):
-                                team = item.get("team") or item.get("teamEntity") or item
-                                if isinstance(team, dict):
-                                    rows.append({
-                                        "rank": to_int(item.get("rank") or item.get("position")),
-                                        "team_id": to_int(team.get("id")),
-                                        "team_name": team.get("name", ""),
-                                        "team_short_name": team.get("shortName", ""),
-                                        "value": to_float(item.get("value") or item.get("stat")),
-                                        "value_str": str(item.get("value", "")),
-                                        "trend": item.get("trend", ""),
-                                        "ranking_type": ranking_type,
-                                        "tournament_name": tournament_name,
-                                    })
-                        if rows:
-                            return (200, rows, tournament_name)
-            except urllib.error.HTTPError:
-                continue
-            except Exception:
-                continue
-        
-        # All patterns failed - return 404
-        return (404, [], tournament_name)
-        
-    except Exception as e:
-        return (500, [], tournament_name)
-
-
-def main():
-    ap = argparse.ArgumentParser()
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Fetch team world/regional rankings from SofaScore team page HTML")
     ap.add_argument("--db", default="data/backfill_sofascore_10y/team_rankings.sqlite")
     ap.add_argument("--state", default="data/backfill_sofascore_10y/team_rankings_state.json")
-    ap.add_argument("--sleep-min", type=float, default=0.3)
-    ap.add_argument("--sleep-max", type=float, default=0.6)
-    ap.add_argument("--category-id", type=int, nargs="+", default=[])
-    ap.add_argument("--ranking-type", default="overall")
-    ap.add_argument("--all-types", action="store_true")
-    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--sleep-min", type=float, default=0.5)
+    ap.add_argument("--sleep-max", type=float, default=1.0)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--team-id", type=int, nargs="+", default=[],
+                    help="Specific team IDs to fetch")
+    ap.add_argument("--use-mysql", action="store_true", help="Write to MySQL instead of SQLite")
+    ap.add_argument("--retry-errors", action="store_true",
+                    help="Re-fetch teams that previously got errors")
     args = ap.parse_args()
 
-    db = sqlite3.connect(args.db)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA busy_timeout=60000")
-    ensure_tables(db)
+    is_mysql = args.use_mysql or use_mysql()
+
+    if is_mysql:
+        conn = mysql_connect()
+        ensure_mysql_tables(conn)
+        print("[INFO] Using MySQL")
+        db = None  # type: ignore
+    else:
+        db = sqlite3.connect(args.db)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA busy_timeout=60000")
+        ensure_tables_sqlite(db)
+        print(f"[INFO] Using SQLite: {args.db}")
+        conn = db
 
     state_path = Path(args.state)
     state = load_state(state_path)
 
-    targets = []
-    stat_types = RANKING_TYPES if args.all_types else [args.ranking_type]
-
-    if args.category_id:
-        cat_ids = args.category_id
-    elif args.all:
-        cat_ids = list(CAT_TO_UT.keys())
+    # Build target list
+    if args.team_id:
+        targets = args.team_id
     else:
-        cat_ids = [1, 8, 9, 23]
+        # Default known teams for smoke test
+        targets = [42, 44, 17, 985, 20]  # Arsenal, Liverpool, Man City, Man Utd, Gillingham
+
+    if not is_mysql and args.retry_errors:
+        # Pick only teams that had errors previously
+        rows = db.execute(
+            "SELECT DISTINCT team_id FROM team_ranking_fetch_log WHERE status_code NOT IN (200, 404)"
+        ).fetchall()
+        targets = [r[0] for r in rows]
+
+    if not is_mysql and not args.team_id and not args.retry_errors:
+        # Exclude already-done teams in normal mode
+        done = set(r[0] for r in db.execute(
+            "SELECT DISTINCT team_id FROM team_ranking_fetch_log WHERE status_code = 200"
+        ).fetchall())
+        targets = [t for t in targets if t not in done]
 
     if args.limit and args.limit > 0:
-        cat_ids = cat_ids[:args.limit]
+        targets = targets[:args.limit]
 
-    for cid in cat_ids:
-        for rt in stat_types:
-            targets.append((cid, rt))
-
-    state["total_targets"] = len(targets)
+    total = len(targets)
+    state["total_targets"] = total
     save_state(state_path, state)
-    print(f"[INFO] team_rankings targets={len(targets)}")
-    print(f"[NOTE] Rankings API endpoints return 404 - see docstring for options")
+    print(f"[INFO] team_rankings targets={total}")
 
-    rows_upserted = 0
+    if total == 0:
+        print("[INFO] Nothing to process")
+        return
 
-    for (category_id, ranking_type) in targets:
+    run_ok = 0
+    run_not_found = 0
+    run_errors = 0
+    run_rows = 0
+    processed_run = 0
+
+    for team_id in targets:
         status_code = 0
         err = ""
         local_rows = 0
-        tournament_name = ""
+        ranking_types_found = ""
+
+        fetched_at_iso = now_iso()
+        fetched_at_mysql = now_mysql()
 
         try:
-            status_code, rows, tournament_name = fetch_rankings(category_id, ranking_type)
-            
-            if status_code == 200 and rows:
-                for r in rows:
-                    db.execute("""
-                        INSERT OR REPLACE INTO team_rankings
-                        (category_id, ranking_type, rank, team_id, team_name, team_short_name,
-                         value, value_str, trend, tournament_name, fetched_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        category_id, r.get("ranking_type", ranking_type),
-                        to_int(r.get("rank")), to_int(r.get("team_id")),
-                        r.get("team_name", ""), r.get("team_short_name", ""),
-                        to_float(r.get("value")), r.get("value_str", ""),
-                        r.get("trend", ""), r.get("tournament_name", ""), now_iso(),
-                    ))
+            status, html = fetch_team_page_html(team_id, retries=3)
+
+            if status == 200:
+                rows_raw, team_meta = parse_team_page(html)
+
+                if not rows_raw:
+                    # Check if the page rendered but has no rankings section
+                    raise ValueError("No rankings data found in __NEXT_DATA__")
+
+                ranking_types_found = ",".join(
+                    str(r.get("type")) for r in rows_raw
+                )
+
+                for raw_row in rows_raw:
+                    row = normalize_ranking_row(raw_row)
+                    row["team_name"] = row["team_name"] or team_meta.get("name", "")
+                    row["team_slug"] = row["team_slug"] or team_meta.get("slug", "")
+
+                    if is_mysql:
+                        upsert_ranking_mysql(conn, row, fetched_at_mysql)
+                    else:
+                        upsert_ranking_sqlite(db, row, fetched_at_iso)
                     local_rows += 1
-                    rows_upserted += 1
-                state["ok"] += 1
-                state["ranking_rows"] += local_rows
-            elif status_code == 404:
-                state["not_found"] += 1
+                    run_rows += 1
+
+                run_ok += 1
+
+            elif status in (404, 410):
+                run_not_found += 1
+                err = "not_found"
+
             else:
-                state["errors"] += 1
-                err = f"HTTP {status_code}"
+                run_errors += 1
+                err = f"HTTP {status}"
 
         except Exception as e:
-            state["errors"] += 1
+            run_errors += 1
             err = str(e)
 
-        db.execute(
-            "INSERT INTO team_ranking_fetch_log (ranking_type, category_id, fetched_at, status_code, team_count, error) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (ranking_type, category_id, now_iso(), status_code, local_rows, err))
-        state["processed"] += 1
+        # Log
+        if is_mysql:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO sofascore_team_ranking_fetch_log
+                (team_id, team_slug, fetched_at, status_code, row_count, ranking_types, error)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                  fetched_at=VALUES(fetched_at), status_code=VALUES(status_code),
+                  row_count=VALUES(row_count), ranking_types=VALUES(ranking_types),
+                  error=VALUES(error)
+            """, (team_id, "", fetched_at_mysql, status, local_rows, ranking_types_found, err))
+            cur.close()
+        else:
+            db.execute("""
+                INSERT INTO team_ranking_fetch_log
+                (team_id, team_slug, fetched_at, status_code, row_count, ranking_types, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (team_id, "", fetched_at_iso, status, local_rows, ranking_types_found, err))
 
-        if state["processed"] % 20 == 0:
-            db.commit()
+        processed_run += 1
+        state["processed"] = int(state.get("processed", 0)) + 1
+        state["last_team_id"] = team_id
+        state["ok"] = int(state.get("ok", 0)) + run_ok
+        state["not_found"] = int(state.get("not_found", 0)) + run_not_found
+        state["errors"] = int(state.get("errors", 0)) + run_errors
+        state["rows_upserted"] = int(state.get("rows_upserted", 0)) + local_rows
+
+        if processed_run % 5 == 0:
+            if is_mysql:
+                conn.commit()
+            else:
+                db.commit()
             save_state(state_path, state)
-            pct = (state["processed"] / len(targets)) * 100
-            print(f"[CHK] {state['processed']}/{len(targets)} ({pct:.0f}%) ok={state['ok']} 404={state['not_found']}")
+            pct = (processed_run / total) * 100 if total else 100
+            print(f"[CHK] run={processed_run}/{total} ({pct:.0f}%) "
+                  f"ok={run_ok} 404={run_not_found} err={run_errors} rows={run_rows}")
 
         time.sleep(random.uniform(args.sleep_min, args.sleep_max))
 
-    db.commit()
+    if is_mysql:
+        conn.commit()
+    else:
+        db.commit()
+        db.close()
+
     save_state(state_path, state)
-    print(f"[DONE] team_rankings: {rows_upserted} rows, ok={state['ok']}, 404={state['not_found']}, err={state['errors']}")
+    print(f"[DONE] team_rankings: rows={run_rows} ok={run_ok} 404={run_not_found} err={run_errors}")
 
 
 if __name__ == "__main__":

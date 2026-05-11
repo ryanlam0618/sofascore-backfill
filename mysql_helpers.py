@@ -437,6 +437,98 @@ def ensure_mysql_tables(conn) -> dict[str, list[str]]:
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """)
 
+
+    # ── Attendance ──────────────────────────────────────────────────────────
+    groups["attendance"] = ["sofascore_attendance_fetch_log", "sofascore_attendance"]
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sofascore_attendance_fetch_log (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          event_id BIGINT,
+          fetched_at DATETIME,
+          status_code INT,
+          attendance_raw VARCHAR(50),
+          attendance_int INT,
+          error TEXT,
+          UNIQUE KEY uk_event (event_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sofascore_attendance (
+          event_id BIGINT PRIMARY KEY,
+          attendance_raw VARCHAR(50),
+          attendance_int INT,
+          fetched_at DATETIME,
+          status_code INT,
+          error TEXT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """)
+
+    # ── Referees ────────────────────────────────────────────────────────────
+    groups["referees"] = ["sofascore_referees_fetch_log", "sofascore_referees"]
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sofascore_referees_fetch_log (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          season_id INT DEFAULT NULL,
+          fetched_at DATETIME DEFAULT NULL,
+          status_code INT DEFAULT NULL,
+          match_count INT DEFAULT NULL,
+          error TEXT COLLATE utf8mb4_unicode_ci
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sofascore_referees (
+          referee_id INT PRIMARY KEY,
+          name VARCHAR(255) DEFAULT NULL,
+          short_name VARCHAR(100) DEFAULT NULL,
+          slug VARCHAR(100) DEFAULT NULL,
+          country_alpha2 VARCHAR(2) DEFAULT NULL,
+          country_name VARCHAR(100) DEFAULT NULL,
+          matches_total INT DEFAULT 0,
+          yellow_cards_total INT DEFAULT 0,
+          red_cards_total INT DEFAULT 0,
+          yellow_red_cards_total INT DEFAULT 0,
+          fetched_at DATETIME DEFAULT NULL,
+          updated_at DATETIME DEFAULT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """)
+
+    # ── Team Rankings ───────────────────────────────────────────────────────
+    groups["team_rankings"] = ["sofascore_team_rankings_fetch_log", "sofascore_team_rankings"]
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sofascore_team_rankings_fetch_log (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          team_id INT,
+          fetched_at DATETIME,
+          status_code INT,
+          error TEXT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sofascore_team_rankings (
+          team_id INT,
+          team_name VARCHAR(255),
+          team_slug VARCHAR(100),
+          year INT,
+          ranking_type VARCHAR(50),
+          ranking_type_name VARCHAR(255),
+          ranking INT,
+          league_name VARCHAR(255),
+          league_id INT,
+          continent_name VARCHAR(100),
+          country_name VARCHAR(100),
+          played INT DEFAULT 0,
+          wins INT DEFAULT 0,
+          draws INT DEFAULT 0,
+          losses INT DEFAULT 0,
+          goals_for INT DEFAULT 0,
+          goals_against INT DEFAULT 0,
+          goal_diff INT DEFAULT 0,
+          points INT DEFAULT 0,
+          fetched_at DATETIME,
+          UNIQUE KEY uk_team_year (team_id, year, ranking_type)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """)
+
     conn.commit()
     cur.close()
     return groups

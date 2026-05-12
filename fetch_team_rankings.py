@@ -233,8 +233,8 @@ def main() -> None:
         description="Fetch team world/regional rankings from SofaScore team page HTML")
     ap.add_argument("--db", default="data/backfill_sofascore_10y/team_rankings.sqlite")
     ap.add_argument("--state", default="data/backfill_sofascore_10y/team_rankings_state.json")
-    ap.add_argument("--sleep-min", type=float, default=0.5)
-    ap.add_argument("--sleep-max", type=float, default=1.0)
+    ap.add_argument("--sleep-min", type=float, default=1.0)
+    ap.add_argument("--sleep-max", type=float, default=2.0)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--team-id", type=int, nargs="+", default=[],
                     help="Specific team IDs to fetch")

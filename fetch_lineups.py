@@ -55,12 +55,33 @@ from mysql_helpers import ensure_mysql_tables, mysql_connect, use_mysql
 WIDGET_BASE = "https://widgets.sofascore.com"
 
 
+def _random_ua():
+    uas = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
+    ]
+    return random.choice(uas)
+
+
+def _default_headers():
+    return {
+        "User-Agent": _random_ua(),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-HK;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+    }
+
+
 def fetch_widget_html(path: str, retries: int = 3, backoff_base: float = 1.5) -> tuple[int, str]:
     """Fetch a widget page as raw HTML. Returns (status_code, html_or_empty)."""
     url = f"{WIDGET_BASE}/{path.lstrip('/')}"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml",
+        "User-Agent": _random_ua(),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-HK;q=0.5",
         "Accept-Encoding": "identity",
         "Referer": "https://www.sofascore.com/",
     }
@@ -264,8 +285,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Backfill match lineups from SofaScore (widget embed endpoint)")
     ap.add_argument("--db", default="data/backfill_sofascore_10y/lineups_PL.sqlite")
     ap.add_argument("--state", default="data/backfill_sofascore_10y/lineups_PL_state.json")
-    ap.add_argument("--sleep-min", type=float, default=0.3)
-    ap.add_argument("--sleep-max", type=float, default=0.6)
+    ap.add_argument("--sleep-min", type=float, default=1.0)
+    ap.add_argument("--sleep-max", type=float, default=2.0)
     ap.add_argument("--checkpoint-every", type=int, default=50)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--event-id", type=int, nargs="+", default=[],
@@ -557,8 +578,10 @@ def api_get_season_events(category_id: int, season_id: int, retries: int = 3) ->
     import urllib.error
     url = f"https://www.sofascore.com/api/v1/tournament/{category_id}/season/{season_id}/events"
     headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
+        "User-Agent": _random_ua(),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-HK;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
     }
     last_status = 500
     for attempt in range(retries):

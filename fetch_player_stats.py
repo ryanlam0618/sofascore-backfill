@@ -155,9 +155,29 @@ def to_float(v, default=0.0):
         return default
 
 
+def _random_ua():
+    uas = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
+    ]
+    return random.choice(uas)
+
+
+def _default_headers():
+    return {
+        "User-Agent": _random_ua(),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-HK;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+    }
+
+
 def api_get(path):
     url = f"{API_BASE}/{path.lstrip('/')}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    req = urllib.request.Request(url, headers=_default_headers())
     resp = urllib.request.urlopen(req, timeout=15)
     return json.loads(resp.read())
 
@@ -333,8 +353,8 @@ def main():
     ap = argparse.ArgumentParser(description="Backfill player season stats from SofaScore")
     ap.add_argument("--db", default="data/backfill_sofascore_10y/player_stats.sqlite")
     ap.add_argument("--state", default="data/backfill_sofascore_10y/player_stats_state.json")
-    ap.add_argument("--sleep-min", type=float, default=0.3)
-    ap.add_argument("--sleep-max", type=float, default=0.6)
+    ap.add_argument("--sleep-min", type=float, default=1.0)
+    ap.add_argument("--sleep-max", type=float, default=2.0)
     ap.add_argument("--category-id", type=int, nargs="+", default=[])
     ap.add_argument("--stat-type", default="goals")
     ap.add_argument("--all-stats", action="store_true")

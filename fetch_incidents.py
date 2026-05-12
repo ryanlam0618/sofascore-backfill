@@ -51,9 +51,34 @@ from mysql_helpers import ensure_mysql_tables, mysql_connect, use_mysql
 API_BASE = "https://www.sofascore.com/api/v1"
 
 
-def api_get(path: str) -> tuple[int, dict]:
+def _random_ua():
+    """Return a random user agent to avoid pattern detection."""
+    uas = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
+    ]
+    return random.choice(uas)
+
+
+def _default_headers():
+    """Return browser-like headers for SofaScore API requests."""
+    return {
+        "User-Agent": _random_ua(),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-HK;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+    }
+
+
+def api_get(path: str, referer: str = "") -> tuple[int, dict]:
     url = f"{API_BASE}/{path.lstrip('/')}"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    headers = _default_headers()
+    if referer:
+        headers["Referer"] = referer
+    req = urllib.request.Request(url, headers=headers)
     try:
         with _get_opener().open(req, timeout=15) as resp:
             return resp.status, json.loads(resp.read())
@@ -168,8 +193,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Backfill match incidents/timeline from SofaScore (direct API)")
     ap.add_argument("--db", default="data/backfill_sofascore_10y/incidents.sqlite")
     ap.add_argument("--state", default="data/backfill_sofascore_10y/incidents_state.json")
-    ap.add_argument("--sleep-min", type=float, default=0.3)
-    ap.add_argument("--sleep-max", type=float, default=0.6)
+    ap.add_argument("--sleep-min", type=float, default=1.0)
+    ap.add_argument("--sleep-max", type=float, default=2.0)
     ap.add_argument("--checkpoint-every", type=int, default=100)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--event-id", type=int, nargs="+", default=[],

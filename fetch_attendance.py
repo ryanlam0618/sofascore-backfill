@@ -143,8 +143,8 @@ def main() -> None:
     ap.add_argument("--state", default="data/backfill_sofascore_10y/attendance_state.json")
     ap.add_argument("--event-id", type=int, nargs="+", default=[],
                     help="Specific event IDs to fetch")
-    ap.add_argument("--sleep-min", type=float, default=0.3)
-    ap.add_argument("--sleep-max", type=float, default=0.7)
+    ap.add_argument("--sleep-min", type=float, default=1.0)
+    ap.add_argument("--sleep-max", type=float, default=2.0)
     ap.add_argument("--use-mysql", action="store_true")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--retry-errors", action="store_true")

@@ -27,12 +27,31 @@ from mysql_helpers import ensure_mysql_tables, mysql_connect, use_mysql
 API_BASE = "https://www.sofascore.com/api/v1"
 
 _proxy_opener = None
+_proxy_list = None
+_last_proxy_idx = -1
 
+def _load_proxy_list():
+    global _proxy_list
+    if _proxy_list is None:
+        proxy_file = os.path.join(os.path.dirname(__file__), "proxy_list.txt")
+        if os.path.exists(proxy_file):
+            with open(proxy_file) as f:
+                _proxy_list = [line.strip() for line in f if line.strip()]
+        else:
+            _proxy_list = []
+    return _proxy_list
 
 def _get_opener():
-    global _proxy_opener
+    global _proxy_opener, _last_proxy_idx
     if _proxy_opener is None:
-        proxy = os.environ.get("SOFA_PROXY", "")
+        proxies = _load_proxy_list()
+        if proxies:
+            idx = (_last_proxy_idx + 1) % len(proxies)
+            _last_proxy_idx = idx
+            proxy = proxies[idx]
+            print(f"[PROXY] Using: {proxy.split('@')[1] if '@' in proxy else proxy}")
+        else:
+            proxy = os.environ.get("SOFA_PROXY", "")
         if proxy:
             ph = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         else:
@@ -148,7 +167,7 @@ def _default_headers():
         "User-Agent": _random_ua(),
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-HK;q=0.5",
-        "Accept-Encoding": "gzip, deflate",
+        # Note: No Accept-Encoding — server may return gzip but urlopen auto-decompresses
     }
 
 
@@ -156,7 +175,7 @@ def api_get(path):
     url = f"{API_BASE}/{path.lstrip('/')}"
     req = urllib.request.Request(url, headers=_default_headers())
     try:
-        with _get_opener().open(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         raise

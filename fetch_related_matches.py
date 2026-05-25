@@ -23,20 +23,39 @@ import urllib.error
 import urllib.error
 
 _proxy_opener = None
+_proxy_list = None
+_last_proxy_idx = -1
+
+def _load_proxy_list():
+    global _proxy_list
+    if _proxy_list is None:
+        proxy_file = os.path.join(os.path.dirname(__file__), "proxy_list.txt")
+        if os.path.exists(proxy_file):
+            with open(proxy_file) as f:
+                _proxy_list = [line.strip() for line in f if line.strip()]
+        else:
+            _proxy_list = []
+    return _proxy_list
 
 def _get_opener():
-    global _proxy_opener
+    global _proxy_opener, _last_proxy_idx
     if _proxy_opener is None:
-        # Load from .env if available
-        env_path = "/root/.openclaw/workspace/.env"
-        env = {}
-        if os.path.exists(env_path):
-            for line in open(env_path):
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    env[k.strip()] = v.strip()
-        proxy = os.environ.get("SOFA_PROXY") or env.get("SOFA_PROXY", "")
+        proxies = _load_proxy_list()
+        if proxies:
+            idx = (_last_proxy_idx + 1) % len(proxies)
+            _last_proxy_idx = idx
+            proxy = proxies[idx]
+            print(f"[PROXY] Using: {proxy.split('@')[1] if '@' in proxy else proxy}")
+        else:
+            env_path = "/root/.openclaw/workspace/.env"
+            env = {}
+            if os.path.exists(env_path):
+                for line in open(env_path):
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        env[k.strip()] = v.strip()
+            proxy = os.environ.get("SOFA_PROXY") or env.get("SOFA_PROXY", "")
         if proxy:
             ph = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         else:
@@ -67,7 +86,7 @@ def _default_headers():
         "User-Agent": _random_ua(),
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-HK;q=0.5",
-        "Accept-Encoding": "gzip, deflate",
+        # Note: No Accept-Encoding — server may return gzip but urlopen auto-decompresses
     }
 
 

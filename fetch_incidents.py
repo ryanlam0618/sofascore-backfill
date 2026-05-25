@@ -15,34 +15,66 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sqlite3
 import time
 import urllib.request
 import urllib.error
-import urllib.error
+
+from anti_block import (
+    build_headers,
+    build_html_headers,
+    shuffle_targets,
+    random_sleep,
+    RequestCounter,
+    get_decoy_pages,
+)
 
 _proxy_opener = None
+_proxy_list = None
+_last_proxy_idx = -1
+
+# Anti-blocking: daily request counter
+_request_counter = None
+
+def _init_counter(daily_limit=5000):
+    global _request_counter
+    if _request_counter is None:
+        _request_counter = RequestCounter(daily_limit=daily_limit)
+    return _request_counter
+
+def _load_proxy_list():
+    global _proxy_list
+    if _proxy_list is None:
+        proxy_file = os.path.join(os.path.dirname(__file__), "proxy_list.txt")
+        if os.path.exists(proxy_file):
+            with open(proxy_file) as f:
+                _proxy_list = [line.strip() for line in f if line.strip()]
+        else:
+            _proxy_list = []
+    return _proxy_list
 
 def _get_opener():
-    global _proxy_opener
+    global _proxy_opener, _last_proxy_idx
     if _proxy_opener is None:
-        # Load from .env if available
-        env_path = "/root/.openclaw/workspace/.env"
-        env = {}
-        if os.path.exists(env_path):
-            for line in open(env_path):
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    env[k.strip()] = v.strip()
-        proxy = os.environ.get("SOFA_PROXY") or env.get("SOFA_PROXY", "")
+        proxies = _load_proxy_list()
+        if proxies:
+            # Round-robin through proxies
+            idx = (_last_proxy_idx + 1) % len(proxies)
+            _last_proxy_idx = idx
+            proxy = proxies[idx]
+            print(f"[PROXY] Using: {proxy.split('@')[1] if '@' in proxy else proxy}")
+        else:
+            proxy = os.environ.get("SOFA_PROXY", "")
         if proxy:
             ph = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         else:
             ph = urllib.request.ProxyHandler({})
         _proxy_opener = urllib.request.build_opener(ph)
     return _proxy_opener
+
+
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -65,27 +97,40 @@ def _random_ua():
 
 def _default_headers():
     """Return browser-like headers for SofaScore API requests."""
-    return {
-        "User-Agent": _random_ua(),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-HK;q=0.5",
-        "Accept-Encoding": "gzip, deflate",
-    }
+    return build_headers()
 
 
 def api_get(path: str, referer: str = "") -> tuple[int, dict]:
+    global _request_counter
     url = f"{API_BASE}/{path.lstrip('/')}"
     headers = _default_headers()
     if referer:
         headers["Referer"] = referer
     req = urllib.request.Request(url, headers=headers)
+    
+    # Track request and check daily limit
+    counter = _init_counter()
+    if counter.is_exhausted:
+        raise RuntimeError(
+            f"[BLOCK] Daily request limit ({counter.daily_limit}) reached. "
+            f"Pausing until tomorrow."
+        )
+    counter.increment()
+    
     try:
         with _get_opener().open(req, timeout=15) as resp:
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return e.code, {}
     except Exception:
-        return 500, {}
+        # Proxy might be dead — try without proxy as fallback
+        ph = urllib.request.ProxyHandler({})
+        opener = urllib.request.build_opener(ph)
+        try:
+            with opener.open(req, timeout=15) as resp:
+                return resp.status, json.loads(resp.read())
+        except Exception:
+            return 500, {}
 
 
 def now_iso() -> str:
@@ -181,6 +226,28 @@ def to_float(v, default=None):
         return default
 
 
+def fetch_event_details(event_id: int) -> dict:
+    """Fetch event metadata: match_date, league, home_team, away_team."""
+    status, data = api_get(f"event/{event_id}")
+    if status == 200:
+        # Event details API wraps data in {"event": {...}}
+        ev = data.get("event", {})
+        ts = ev.get("startTimestamp", 0)
+        match_date = ""
+        if ts:
+            try:
+                match_date = datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+        return {
+            "match_date": match_date,
+            "league": (ev.get("tournament") or {}).get("name", ""),
+            "home_team": (ev.get("homeTeam") or {}).get("name", ""),
+            "away_team": (ev.get("awayTeam") or {}).get("name", ""),
+        }
+    return {"match_date": "", "league": "", "home_team": "", "away_team": ""}
+
+
 def fetch_incidents(event_id: int) -> tuple[int, list]:
     """Fetch incidents for an event. Returns (status_code, incidents_list)."""
     status, data = api_get(f"event/{event_id}/incidents")
@@ -193,8 +260,14 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Backfill match incidents/timeline from SofaScore (direct API)")
     ap.add_argument("--db", default="data/backfill_sofascore_10y/incidents.sqlite")
     ap.add_argument("--state", default="data/backfill_sofascore_10y/incidents_state.json")
-    ap.add_argument("--sleep-min", type=float, default=1.0)
-    ap.add_argument("--sleep-max", type=float, default=2.0)
+    ap.add_argument("--sleep-min", type=float, default=2.0)
+    ap.add_argument("--sleep-max", type=float, default=5.0)
+    ap.add_argument("--daily-limit", type=int, default=5000,
+                    help="Maximum API requests per day (anti-block)")
+    ap.add_argument("--no-shuffle", action="store_true",
+                    help="Disable target shuffling (not recommended)")
+    ap.add_argument("--browse-every", type=int, default=20,
+                    help="Fetch decoy page every N requests (0=disabled)")
     ap.add_argument("--checkpoint-every", type=int, default=100)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--event-id", type=int, nargs="+", default=[],
@@ -223,6 +296,11 @@ def main() -> None:
 
     state_path = Path(args.state)
     state = load_state(state_path)
+    
+    # Initialize anti-block counter
+    counter = _init_counter(daily_limit=args.daily_limit)
+    print(f"[INFO] Daily request limit: {args.daily_limit}")
+    print(f"[INFO] Sleep range: {args.sleep_min}-{args.sleep_max}s")
 
     # Build target event IDs
     if args.event_id:
@@ -237,6 +315,11 @@ def main() -> None:
         if args.past_only:
             all_evs = [e for e in all_evs if e.get("startTimestamp", 9999999999) < now_ts]
         targets = [int(e["id"]) for e in all_evs if e.get("id")]
+    
+    # Shuffle targets to avoid sequential access pattern
+    if not args.no_shuffle:
+        targets = shuffle_targets(targets)
+        print(f"[INFO] Targets shuffled to avoid sequential pattern")
 
     # Filter out already-processed (SQLite only; MySQL dedup handled by ON DUPLICATE KEY)
     if not is_mysql:
@@ -261,6 +344,14 @@ def main() -> None:
         status_code = 0
         err = ""
         upserted = 0
+
+        # Fetch event metadata FIRST (before incidents, so we have match info)
+        fetched_ts_meta = now_mysql() if is_mysql else now_iso()
+        event_meta = fetch_event_details(event_id)
+        match_date = event_meta["match_date"]
+        league = event_meta["league"]
+        home_team = event_meta["home_team"]
+        away_team = event_meta["away_team"]
 
         try:
             status_code, incidents = fetch_incidents(event_id)
@@ -299,7 +390,10 @@ def main() -> None:
                         """, (
                             event_id,
                             to_int(inc.get("id")),
-                            "", "", "", "",
+                            match_date,
+                            league,
+                            home_team,
+                            away_team,
                             inc.get("incidentType"),
                             to_int(inc.get("time")),
                             to_int(inc.get("addedTime")),
@@ -336,7 +430,10 @@ def main() -> None:
                         """, (
                             event_id,
                             to_int(inc.get("id")),
-                            "", "", "", "",
+                            match_date,
+                            league,
+                            home_team,
+                            away_team,
                             inc.get("incidentType"),
                             to_int(inc.get("time")),
                             to_int(inc.get("addedTime")),
@@ -370,18 +467,21 @@ def main() -> None:
                 cur = conn.cursor()
                 cur.execute("""
                     INSERT INTO sofascore_incident_events
-                    (event_id, status_code, incident_count, fetched_at, error)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE status_code=VALUES(status_code),
+                    (event_id, match_date, league, home_team, away_team, status_code, incident_count, fetched_at, error)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                      match_date=VALUES(match_date), league=VALUES(league),
+                      home_team=VALUES(home_team), away_team=VALUES(away_team),
+                      status_code=VALUES(status_code),
                       incident_count=VALUES(incident_count), fetched_at=VALUES(fetched_at), error=VALUES(error)
-                """, (event_id, status_code, len(incidents), now_mysql(), err))
+                """, (event_id, match_date, league, home_team, away_team, status_code, len(incidents), fetched_ts_meta, err))
                 cur.close()
             else:
                 db.execute("""
                     INSERT OR REPLACE INTO incident_events
-                    (event_id, status_code, incident_count, fetched_at, error)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (event_id, status_code, len(incidents), now_iso(), err))
+                    (event_id, match_date, league, home_team, away_team, status_code, incident_count, fetched_at, error)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (event_id, match_date, league, home_team, away_team, status_code, len(incidents), fetched_ts_meta, err))
 
         except Exception as e:
             state["errors"] = int(state.get("errors", 0)) + 1
@@ -390,22 +490,26 @@ def main() -> None:
                 cur = conn.cursor()
                 cur.execute("""
                     INSERT INTO sofascore_incident_events
-                    (event_id, status_code, incident_count, fetched_at, error)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE status_code=VALUES(status_code),
+                    (event_id, match_date, league, home_team, away_team, status_code, incident_count, fetched_at, error)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                      match_date=VALUES(match_date), league=VALUES(league),
+                      home_team=VALUES(home_team), away_team=VALUES(away_team),
+                      status_code=VALUES(status_code),
                       incident_count=VALUES(incident_count), fetched_at=VALUES(fetched_at), error=VALUES(error)
-                """, (event_id, status_code, 0, now_mysql(), err))
+                """, (event_id, match_date, league, home_team, away_team, status_code, 0, fetched_ts_meta, err))
                 cur.close()
             else:
                 db.execute("""
                     INSERT OR REPLACE INTO incident_events
-                    (event_id, status_code, incident_count, fetched_at, error)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (event_id, status_code, 0, now_iso(), err))
+                    (event_id, match_date, league, home_team, away_team, status_code, incident_count, fetched_at, error)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (event_id, match_date, league, home_team, away_team, status_code, 0, fetched_ts_meta, err))
 
         state["rows_upserted"] = int(state.get("rows_upserted", 0)) + upserted
         state["processed"] = int(state.get("processed", 0)) + 1
         state["last_event_id"] = event_id
+        state["last_date"] = match_date
         processed_run += 1
 
         if processed_run % args.checkpoint_every == 0:
@@ -418,7 +522,30 @@ def main() -> None:
             print(f"[CHK] run={processed_run}/{total} ({pct:.2f}%) ok={state['ok']} 404={state['not_found']} err={state['errors']}")
 
         time.sleep(random.uniform(args.sleep_min, args.sleep_max))
+        
+        # Occasionally fetch decoy pages to look like human browsing
+        if args.browse_every > 0 and processed_run % args.browse_every == 0:
+            try:
+                # Fetch a decoy page
+                decoy_url = f"https://www.sofascore.com/"
+                decoy_headers = build_html_headers()
+                decoy_req = urllib.request.Request(decoy_url, headers=decoy_headers)
+                with _get_opener().open(decoy_req, timeout=10) as resp:
+                    # Just verify it works, don't store anything
+                    _ = resp.read()
+                counter.increment()  # Count decoy request too
+                print(f"[DECOY] Browsed homepage")
+                time.sleep(random.uniform(1.0, 2.0))
+            except Exception:
+                pass  # Ignore decoy failures
+    
+    # Check if approaching daily limit
+    if counter.usage_pct >= 0.8 and processed_run % 100 == 0:
+        print(f"[WARN] Daily usage: {counter.usage_pct*100:.1f}% ({counter.count}/{counter.daily_limit})")
 
+    # Final check before exit
+    print(f"[INFO] Requests today: {counter.count}/{counter.daily_limit} ({counter.usage_pct*100:.1f}%)")
+    
     if is_mysql:
         conn.commit()
     else:

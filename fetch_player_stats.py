@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sqlite3
 import time
@@ -25,20 +26,39 @@ import urllib.error
 import urllib.error
 
 _proxy_opener = None
+_proxy_list = None
+_last_proxy_idx = -1
+
+def _load_proxy_list():
+    global _proxy_list
+    if _proxy_list is None:
+        proxy_file = os.path.join(os.path.dirname(__file__), "proxy_list.txt")
+        if os.path.exists(proxy_file):
+            with open(proxy_file) as f:
+                _proxy_list = [line.strip() for line in f if line.strip()]
+        else:
+            _proxy_list = []
+    return _proxy_list
 
 def _get_opener():
-    global _proxy_opener
+    global _proxy_opener, _last_proxy_idx
     if _proxy_opener is None:
-        # Load from .env if available
-        env_path = "/root/.openclaw/workspace/.env"
-        env = {}
-        if os.path.exists(env_path):
-            for line in open(env_path):
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    env[k.strip()] = v.strip()
-        proxy = os.environ.get("SOFA_PROXY") or env.get("SOFA_PROXY", "")
+        proxies = _load_proxy_list()
+        if proxies:
+            idx = (_last_proxy_idx + 1) % len(proxies)
+            _last_proxy_idx = idx
+            proxy = proxies[idx]
+            print(f"[PROXY] Using: {proxy.split('@')[1] if '@' in proxy else proxy}")
+        else:
+            env_path = "/root/.openclaw/workspace/.env"
+            env = {}
+            if os.path.exists(env_path):
+                for line in open(env_path):
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        env[k.strip()] = v.strip()
+            proxy = os.environ.get("SOFA_PROXY") or env.get("SOFA_PROXY", "")
         if proxy:
             ph = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         else:
@@ -69,6 +89,14 @@ STAT_TYPES = [
     "appearances", "yellowCards", "redCards",
     "goalsByPenalties", "shotsOnTarget",
 ]
+
+# Short names map to actual API order_by values
+STAT_TYPE_SHORT = {
+    "minutes_played": "minutes",
+    "yellow_cards": "yellowCards",
+    "red_cards": "redCards",
+    "goals_assists_total": "goals",  # placeholder, will fetch both
+}
 
 
 def now_iso():
@@ -171,14 +199,14 @@ def _default_headers():
         "User-Agent": _random_ua(),
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-HK;q=0.5",
-        "Accept-Encoding": "gzip, deflate",
+        # Note: No Accept-Encoding — server may return gzip but urlopen auto-decompresses
     }
 
 
 def api_get(path):
     url = f"{API_BASE}/{path.lstrip('/')}"
     req = urllib.request.Request(url, headers=_default_headers())
-    resp = urllib.request.urlopen(req, timeout=15)
+    resp = _get_opener().open(req, timeout=15)
     return json.loads(resp.read())
 
 
@@ -357,8 +385,12 @@ def main():
     ap.add_argument("--sleep-max", type=float, default=2.0)
     ap.add_argument("--category-id", type=int, nargs="+", default=[])
     ap.add_argument("--stat-type", default="goals")
+    ap.add_argument("--stat-types", default="",
+                    help="Comma-separated stat types: goals,assists,xg,xa,appearances,minutes_played,yellow_cards,red_cards,goals_assists_total")
     ap.add_argument("--all-stats", action="store_true")
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--run-all", action="store_true",
+                    help="Iterate through all stat types for each category/season")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--no-player-stats", action="store_true",
                     help="Skip per-player /player/{id}/statistics calls (faster, less data)")
@@ -381,9 +413,19 @@ def main():
     state_path = Path(args.state)
     state = load_state(state_path)
 
-    targets = []
-    stat_types = STAT_TYPES if args.all_stats else [args.stat_type]
+    # Resolve stat types
+    if args.run_all:
+        # --run-all: iterate through all known stat types
+        stat_types = list(STAT_TYPES)
+    elif args.stat_types:
+        # --stat-types: comma-separated list
+        stat_types = [s.strip() for s in args.stat_types.split(",") if s.strip()]
+    elif args.all_stats:
+        stat_types = list(STAT_TYPES)
+    else:
+        stat_types = [args.stat_type]
 
+    targets = []
     if args.category_id:
         cat_ids = args.category_id
     elif args.all:
@@ -397,7 +439,9 @@ def main():
     for cid in cat_ids:
         ut_id = CAT_TO_UT.get(cid, cid)
         for stat in stat_types:
-            targets.append((cid, ut_id, stat))
+            # Map short name to API order_by value
+            api_stat = STAT_TYPE_SHORT.get(stat, stat)
+            targets.append((cid, ut_id, stat, api_stat))
 
     total = len(targets)
     state["total_targets"] = total
@@ -408,7 +452,7 @@ def main():
 
     rows_upserted = 0
 
-    for (category_id, ut_id, stat_type) in targets:
+    for (category_id, ut_id, stat_type, api_stat) in targets:
         status_code = 0
         err = ""
         local_rows = 0
@@ -421,9 +465,9 @@ def main():
                 state["not_found"] += 1
                 status_code = 404
             else:
-                do_get_stats = get_player_stats and stat_type in ("goals", "assists", "xg", "xa")
+                do_get_stats = get_player_stats and stat_type in ("goals", "assists", "xg", "xa", "goals_assists_total")
                 status_code, rows, ut_name = fetch_top_players_with_stats(
-                    ut_id, season_id, stat_type, get_stats=do_get_stats
+                    ut_id, season_id, api_stat, get_stats=do_get_stats
                 )
 
                 if status_code == 200 and rows:

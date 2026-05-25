@@ -1,0 +1,184 @@
+# SofaScore 10-Year Backfill — Competition Configuration
+# Generated: 2026-05-04, Updated: 2026-05-08
+#
+# Status values:
+#   discovered  - seasons discovered via discover_seasons.py
+#   confirmed  - PL only, season IDs verified with live API
+#   blocked    - ut_id unknown, cannot discover
+#
+# Season discovery: python3 discover_seasons.py --all
+
+competitions:
+  # ── Top 5 European Leagues ────────────────────────────────────────────────
+  - name: Premier League
+    category_id: 1
+    ut_id: 17
+    cat_country: England
+    season_mode: national
+    season_id_2024_25: 61627
+    season_id_2025_26: null
+    status: confirmed
+    notes: "381 events per season, rate-limited ~1req/s"
+
+  - name: La Liga
+    category_id: 32
+    ut_id: 8
+    cat_country: Spain
+    season_mode: national
+    season_id_2024_25: null
+    status: discovered
+
+  - name: Serie A
+    category_id: 31
+    ut_id: 23
+    cat_country: Italy
+    season_mode: national
+    season_id_2024_25: null
+    status: discovered
+
+  - name: Bundesliga
+    category_id: 30
+    ut_id: 9
+    cat_country: Germany
+    season_mode: national
+    season_id_2024_25: null
+    status: discovered
+
+  - name: Ligue 1
+    category_id: 7
+    ut_id: 34
+    cat_country: France
+    season_mode: national
+    season_id_2024_25: null
+    status: discovered
+
+  # ── Asian Leagues ─────────────────────────────────────────────────────────
+  - name: J1 League
+    category_id: 52
+    ut_id: 196
+    cat_country: Japan
+    season_mode: national
+    status: discovered
+
+  - name: K League 1
+    category_id: 291
+    ut_id: 410
+    cat_country: South Korea
+    season_mode: national
+    status: discovered
+
+  - name: A-League Men
+    category_id: 34
+    ut_id: 136
+    cat_country: Australia
+    season_mode: national
+    status: discovered
+
+  - name: Chinese Super League
+    category_id: 99
+    ut_id: 649
+    cat_country: China
+    season_mode: national
+    status: discovered
+
+  # ── UEFA Competitions ─────────────────────────────────────────────────────
+  - name: UCL
+    category_id: 1465
+    ut_id: 7
+    cat_country: europe
+    season_mode: uefa
+    status: discovered
+    notes: "unique-tournament path required"
+
+  - name: UEL
+    category_id: 1465
+    ut_id: 679
+    cat_country: europe
+    season_mode: uefa
+    status: discovered
+
+  - name: UECL
+    category_id: 1465
+    ut_id: 17015
+    cat_country: europe
+    season_mode: uefa
+    status: discovered
+
+  - name: AFC Champions League
+    category_id: 1467
+    ut_id: 463
+    cat_country: asia
+    season_mode: international
+    status: discovered
+
+  # ── Domestic Cups ─────────────────────────────────────────────────────────
+  - name: FA Cup
+    category_id: 1
+    ut_id: 19
+    cat_country: England
+    season_mode: cup
+    status: discovered
+
+  - name: EFL Cup
+    category_id: 1
+    ut_id: 21
+    cat_country: England
+    season_mode: cup
+    status: discovered
+
+  - name: Copa del Rey
+    category_id: 32
+    ut_id: 329
+    cat_country: Spain
+    season_mode: cup
+    status: discovered
+
+  - name: Coppa Italia
+    category_id: 31
+    ut_id: 328
+    cat_country: Italy
+    season_mode: cup
+    status: discovered
+
+  - name: Coupe de France
+    category_id: 7
+    ut_id: 335
+    cat_country: France
+    season_mode: cup
+    status: discovered
+
+  - name: DFB Pokal
+    category_id: 30
+    ut_id: 217
+    cat_country: Germany
+    season_mode: cup
+    status: discovered
+
+  - name: J.League Cup
+    category_id: 52
+    ut_id: 101
+    cat_country: Japan
+    season_mode: cup
+    status: discovered
+
+  - name: Emperor's Cup
+    category_id: 52
+    ut_id: 323
+    cat_country: Japan
+    season_mode: cup
+    status: discovered
+
+  - name: Australia Cup
+    category_id: 34
+    ut_id: 1786
+    cat_country: Australia
+    season_mode: cup
+    status: discovered
+
+  - name: Chinese FA Cup
+    category_id: 99
+    ut_id: null
+    cat_country: China
+    season_mode: cup
+    status: blocked
+    notes: "ut_id unknown — cannot discover seasons"

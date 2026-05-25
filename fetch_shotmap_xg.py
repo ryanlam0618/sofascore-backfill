@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sqlite3
 import time
@@ -25,21 +26,47 @@ import urllib.request
 import urllib.error
 import urllib.error
 
+from anti_block import (
+    build_headers,
+    shuffle_targets,
+    random_sleep,
+    RequestCounter,
+)
+
 _proxy_opener = None
+_proxy_list = None
+_last_proxy_idx = -1
+
+def _load_proxy_list():
+    global _proxy_list
+    if _proxy_list is None:
+        proxy_file = os.path.join(os.path.dirname(__file__), "proxy_list.txt")
+        if os.path.exists(proxy_file):
+            with open(proxy_file) as f:
+                _proxy_list = [line.strip() for line in f if line.strip()]
+        else:
+            _proxy_list = []
+    return _proxy_list
 
 def _get_opener():
-    global _proxy_opener
+    global _proxy_opener, _last_proxy_idx
     if _proxy_opener is None:
-        # Load from .env if available
-        env_path = "/root/.openclaw/workspace/.env"
-        env = {}
-        if os.path.exists(env_path):
-            for line in open(env_path):
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    env[k.strip()] = v.strip()
-        proxy = os.environ.get("SOFA_PROXY") or env.get("SOFA_PROXY", "")
+        proxies = _load_proxy_list()
+        if proxies:
+            idx = (_last_proxy_idx + 1) % len(proxies)
+            _last_proxy_idx = idx
+            proxy = proxies[idx]
+            print(f"[PROXY] Using: {proxy.split('@')[1] if '@' in proxy else proxy}")
+        else:
+            env_path = "/root/.openclaw/workspace/.env"
+            env = {}
+            if os.path.exists(env_path):
+                for line in open(env_path):
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        env[k.strip()] = v.strip()
+            proxy = os.environ.get("SOFA_PROXY") or env.get("SOFA_PROXY", "")
         if proxy:
             ph = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         else:
@@ -50,6 +77,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from mysql_helpers import ensure_mysql_tables, mysql_connect, use_mysql
+
+_proxy_opener = None
+_proxy_list = None
+_last_proxy_idx = -1
+_request_counter = None
+
+def _init_counter(daily_limit=5000):
+    global _request_counter
+    if _request_counter is None:
+        _request_counter = RequestCounter(daily_limit=daily_limit)
+    return _request_counter
 
 API_BASE = "https://www.sofascore.com/api/v1"
 
@@ -67,26 +105,28 @@ def _random_ua():
 
 
 def _default_headers():
-    return {
-        "User-Agent": _random_ua(),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-HK;q=0.5",
-        "Accept-Encoding": "gzip, deflate",
-    }
+    return build_headers()
 
 
 def api_get(path: str, referer: str = "") -> tuple[int, dict]:
+    global _request_counter
     url = f"{API_BASE}/{path.lstrip('/')}"
     headers = _default_headers()
     if referer:
         headers["Referer"] = referer
     req = urllib.request.Request(url, headers=headers)
+    
+    counter = _init_counter()
+    if counter.is_exhausted:
+        raise RuntimeError(f"[BLOCK] Daily request limit reached.")
+    counter.increment()
+    
     try:
         with _get_opener().open(req, timeout=15) as resp:
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return e.code, {}
-    except Exception as e:
+    except Exception:
         return 500, {}
 
 
@@ -152,8 +192,10 @@ def main() -> None:
     )
     ap.add_argument("--db", default="data/backfill_sofascore_10y/shotmap_xg.sqlite")
     ap.add_argument("--state", default="data/backfill_sofascore_10y/shotmap_xg_state.json")
-    ap.add_argument("--sleep-min", type=float, default=1.0)
-    ap.add_argument("--sleep-max", type=float, default=2.0)
+    ap.add_argument("--sleep-min", type=float, default=2.0)
+    ap.add_argument("--sleep-max", type=float, default=5.0)
+    ap.add_argument("--daily-limit", type=int, default=5000)
+    ap.add_argument("--no-shuffle", action="store_true")
     ap.add_argument("--checkpoint-every", type=int, default=100)
     ap.add_argument("--limit", type=int, default=0,
                     help="Max events to process (0 = unlimited)")
@@ -215,6 +257,11 @@ def main() -> None:
             all_evs = [e for e in all_evs
                        if e.get("startTimestamp", 9999999999) < now_ts]
         targets = [int(e["id"]) for e in all_evs if e.get("id")]
+        
+        # Shuffle targets to avoid sequential access
+        if not args.no_shuffle:
+            targets = shuffle_targets(targets)
+            print(f"[INFO] Targets shuffled")
 
         # Filter out already-processed (only for non-refetch)
         if not is_mysql:
@@ -358,6 +405,11 @@ def main() -> None:
                   f"has_xg={state['has_xg']}")
 
         time.sleep(random.uniform(args.sleep_min, args.sleep_max))
+        
+        # Update usage info periodically
+        counter = _init_counter()
+        if processed_in_run % 200 == 0 and processed_in_run > 0:
+            print(f"[INFO] Usage: {counter.count}/{counter.daily_limit} ({counter.usage_pct*100:.1f}%)")
 
     if is_mysql:
         conn.commit()
@@ -367,6 +419,8 @@ def main() -> None:
     save_state(state_path, state)
     print(f"[DONE] shotmap_xg: processed={processed_in_run} ok={state['ok']} "
           f"404={state['not_found']} err={state['errors']} has_xg={state['has_xg']}")
+    counter = _init_counter()
+    print(f"[INFO] Requests: {counter.count}/{counter.daily_limit} ({counter.usage_pct*100:.1f}%)")
 
 
 if __name__ == "__main__":

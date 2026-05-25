@@ -223,3 +223,89 @@ CREATE TABLE IF NOT EXISTS sofascore_shotmap_details (
   error TEXT,
   UNIQUE KEY uk_shotmap_details (event_id, shot_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ── Team Rankings ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS sofascore_team_ranking_fetch_log (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  team_id INT,
+  team_slug VARCHAR(255),
+  fetched_at DATETIME,
+  status_code INT,
+  row_count INT,
+  ranking_types VARCHAR(255),
+  error TEXT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS sofascore_team_rankings (
+  team_id INT,
+  team_name VARCHAR(255),
+  team_slug VARCHAR(255),
+  year VARCHAR(20),
+  ranking_type INT,
+  ranking_type_name VARCHAR(50),
+  ranking INT,
+  points INT,
+  ranking_class VARCHAR(50),
+  fetched_at DATETIME,
+  UNIQUE KEY uk_team_rankings (team_id, year, ranking_type)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ── Managers ─────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS sofascore_manager_fetch_log (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  source VARCHAR(20),
+  source_id VARCHAR(50),
+  fetched_at DATETIME,
+  status_code INT,
+  error TEXT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS sofascore_managers (
+  manager_id INT PRIMARY KEY,
+  name VARCHAR(255),
+  short_name VARCHAR(255),
+  slug VARCHAR(255),
+  country_alpha2 VARCHAR(10),
+  country_name VARCHAR(255),
+  birth_date VARCHAR(50),
+  age INT,
+  active_team_id INT,
+  active_team_name VARCHAR(255),
+  fetched_at DATETIME,
+  updated_at DATETIME
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ── Referees ────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS sofascore_referee_fetch_log (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  source VARCHAR(20),
+  source_id VARCHAR(50),
+  fetched_at DATETIME,
+  status_code INT,
+  error TEXT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS sofascore_referees (
+  referee_id INT PRIMARY KEY,
+  name VARCHAR(255),
+  short_name VARCHAR(255),
+  slug VARCHAR(255),
+  country_alpha2 VARCHAR(10),
+  country_name VARCHAR(255),
+  matches_total INT DEFAULT 0,
+  yellow_cards_total INT DEFAULT 0,
+  red_cards_total INT DEFAULT 0,
+  yellow_red_cards_total INT DEFAULT 0,
+  fetched_at DATETIME,
+  updated_at DATETIME
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ── Attendance ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS sofascore_attendance_fetch_log (
+  event_id BIGINT PRIMARY KEY,
+  fetched_at DATETIME,
+  status_code INT,
+  attendance_raw VARCHAR(50),
+  attendance_int INT,
+  error TEXT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

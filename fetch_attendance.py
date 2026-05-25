@@ -35,7 +35,15 @@ _proxy_opener: urllib.request.OpenerDirector | None = None
 def _get_opener() -> urllib.request.OpenerDirector:
     global _proxy_opener
     if _proxy_opener is None:
-        proxy = os.environ.get("SOFA_PROXY", "")
+        proxy_file = os.path.join(os.path.dirname(__file__), "proxy_list.txt")
+        proxies = []
+        if os.path.exists(proxy_file):
+            with open(proxy_file) as f:
+                proxies = [line.strip() for line in f if line.strip()]
+        if proxies:
+            proxy = proxies[len(proxies) % 5]  # rotate
+        else:
+            proxy = os.environ.get("SOFA_PROXY", "")
         if proxy:
             ph = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         else:

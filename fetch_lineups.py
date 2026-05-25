@@ -24,23 +24,55 @@ import sqlite3
 import time
 import urllib.request
 import urllib.error
-import urllib.error
+
+from anti_block import (
+    build_headers,
+    build_html_headers,
+    shuffle_targets,
+    RequestCounter,
+)
 
 _proxy_opener = None
+_proxy_list = None
+_last_proxy_idx = -1
+_request_counter = None
+
+def _init_counter(daily_limit=5000):
+    global _request_counter
+    if _request_counter is None:
+        _request_counter = RequestCounter(daily_limit=daily_limit)
+    return _request_counter
+
+def _load_proxy_list():
+    global _proxy_list
+    if _proxy_list is None:
+        proxy_file = os.path.join(os.path.dirname(__file__), "proxy_list.txt")
+        if os.path.exists(proxy_file):
+            with open(proxy_file) as f:
+                _proxy_list = [line.strip() for line in f if line.strip()]
+        else:
+            _proxy_list = []
+    return _proxy_list
 
 def _get_opener():
-    global _proxy_opener
+    global _proxy_opener, _last_proxy_idx
     if _proxy_opener is None:
-        # Load from .env if available
-        env_path = "/root/.openclaw/workspace/.env"
-        env = {}
-        if os.path.exists(env_path):
-            for line in open(env_path):
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    env[k.strip()] = v.strip()
-        proxy = os.environ.get("SOFA_PROXY") or env.get("SOFA_PROXY", "")
+        proxies = _load_proxy_list()
+        if proxies:
+            idx = (_last_proxy_idx + 1) % len(proxies)
+            _last_proxy_idx = idx
+            proxy = proxies[idx]
+            print(f"[PROXY] Using: {proxy.split('@')[1] if '@' in proxy else proxy}")
+        else:
+            env_path = "/root/.openclaw/workspace/.env"
+            env = {}
+            if os.path.exists(env_path):
+                for line in open(env_path):
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        env[k.strip()] = v.strip()
+            proxy = os.environ.get("SOFA_PROXY") or env.get("SOFA_PROXY", "")
         if proxy:
             ph = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         else:
@@ -67,12 +99,7 @@ def _random_ua():
 
 
 def _default_headers():
-    return {
-        "User-Agent": _random_ua(),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-HK;q=0.5",
-        "Accept-Encoding": "gzip, deflate",
-    }
+    return build_headers()
 
 
 def fetch_widget_html(path: str, retries: int = 3, backoff_base: float = 1.5) -> tuple[int, str]:
@@ -285,8 +312,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Backfill match lineups from SofaScore (widget embed endpoint)")
     ap.add_argument("--db", default="data/backfill_sofascore_10y/lineups_PL.sqlite")
     ap.add_argument("--state", default="data/backfill_sofascore_10y/lineups_PL_state.json")
-    ap.add_argument("--sleep-min", type=float, default=1.0)
-    ap.add_argument("--sleep-max", type=float, default=2.0)
+    ap.add_argument("--sleep-min", type=float, default=2.0)
+    ap.add_argument("--sleep-max", type=float, default=5.0)
+    ap.add_argument("--daily-limit", type=int, default=5000)
+    ap.add_argument("--no-shuffle", action="store_true")
     ap.add_argument("--checkpoint-every", type=int, default=50)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--event-id", type=int, nargs="+", default=[],
@@ -315,7 +344,10 @@ def main() -> None:
         db.execute("PRAGMA busy_timeout=60000")
         ensure_tables(db)
         print(f"[INFO] Using SQLite: {args.db}")
-        conn = db
+
+    print(f"[INFO] Sleep range: {args.sleep_min}-{args.sleep_max}s")
+    counter = _init_counter(daily_limit=args.daily_limit)
+    print(f"[INFO] Daily limit: {args.daily_limit}")
 
     state_path = Path(args.state)
     state = load_state(state_path)
@@ -334,6 +366,11 @@ def main() -> None:
         if args.past_only:
             all_evs = [e for e in all_evs if e.get("startTimestamp", 9999999999) < now_ts]
         targets = [int(e["id"]) for e in all_evs if e.get("id")]
+    
+    # Shuffle targets to avoid sequential access
+    if not args.no_shuffle:
+        targets = shuffle_targets(targets)
+        print(f"[INFO] Targets shuffled")
 
     # Filter based on retry mode
     if not is_mysql:
@@ -559,7 +596,12 @@ def main() -> None:
                   f"players={state['players_upserted']}")
 
         time.sleep(random.uniform(args.sleep_min, args.sleep_max))
-
+        
+        # Update usage periodically
+        if processed_run % 100 == 0 and processed_run > 0:
+            counter = _init_counter()
+            print(f"[INFO] Usage: {counter.count}/{counter.daily_limit} ({counter.usage_pct*100:.1f}%)")
+    
     if is_mysql:
         conn.commit()
     else:
@@ -567,6 +609,8 @@ def main() -> None:
         db.close()
 
     save_state(state_path, state)
+    counter = _init_counter()
+    print(f"[INFO] Requests: {counter.count}/{counter.daily_limit} ({counter.usage_pct*100:.1f}%)")
     print(f"[DONE] lineups completed: players={state['players_upserted']} "
           f"ok={state['ok']} 404={state['not_found']} err={state['errors']}")
 
@@ -577,12 +621,7 @@ def api_get_season_events(category_id: int, season_id: int, retries: int = 3) ->
     """Fetch season events via the public API (used for target discovery only)."""
     import urllib.error
     url = f"https://www.sofascore.com/api/v1/tournament/{category_id}/season/{season_id}/events"
-    headers = {
-        "User-Agent": _random_ua(),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-HK;q=0.5",
-        "Accept-Encoding": "gzip, deflate",
-    }
+    headers = build_headers()
     last_status = 500
     for attempt in range(retries):
         req = urllib.request.Request(url, headers=headers)

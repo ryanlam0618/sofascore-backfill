@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional
 
@@ -22,13 +23,17 @@ from playwright.async_api import async_playwright
 
 BROWSER_BASE = "https://www.sofascore.com"
 API_BASE = "https://www.sofascore.com/api/v1"
-PROXY_SERVER = "http://p.webshare.io:80"
-PROXY_USERNAME = "aeptenjc-rotate"
-PROXY_PASSWORD = "dztr57tcycoz"
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+PROXY_SERVER = os.getenv("SOFA_PROXY", "http://p.webshare.io:80")
+PROXY_USERNAME = os.getenv("SOFA_PROXY_USERNAME", "aeptenjc-rotate")
+PROXY_PASSWORD = os.getenv("SOFA_PROXY_PASSWORD", "")
+DEFAULT_USER_AGENT = os.getenv(
+    "SOFA_USER_AGENT",
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+    ),
 )
+DEFAULT_ACCEPT_LANGUAGE = os.getenv("SOFA_ACCEPT_LANGUAGE", "en-US,en;q=0.9")
 
 
 @dataclass(frozen=True)
@@ -87,7 +92,12 @@ class SofaScoreBrowserClient:
         self.context = await self.browser.new_context(
             viewport={"width": 1920, "height": 1080},
             user_agent=DEFAULT_USER_AGENT,
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            proxy={
+                "server": PROXY_SERVER,
+                "username": PROXY_USERNAME,
+                "password": PROXY_PASSWORD,
+            } if PROXY_SERVER else None,
+            extra_http_headers={"Accept-Language": DEFAULT_ACCEPT_LANGUAGE},
         )
         self.page = await self.context.new_page()
         return self

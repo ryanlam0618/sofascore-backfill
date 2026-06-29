@@ -116,7 +116,7 @@ def now_mysql() -> str:
 
 def ensure_tables_sqlite(conn: sqlite3.Connection) -> None:
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS sofascore_referee_fetch_log (
+        CREATE TABLE IF NOT EXISTS fetch_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source TEXT,
             source_id TEXT,
@@ -126,7 +126,7 @@ def ensure_tables_sqlite(conn: sqlite3.Connection) -> None:
         )
     """)
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS sofascore_referees (
+        CREATE TABLE IF NOT EXISTS referees (
             referee_id INTEGER PRIMARY KEY,
             name TEXT,
             short_name TEXT,
@@ -165,7 +165,7 @@ def save_state(path: Path, state: dict) -> None:
 
 def upsert_referee_sqlite(db, ref: dict, fetched_at: str) -> None:
     db.execute("""
-        INSERT OR REPLACE INTO sofascore_referees
+        INSERT OR REPLACE INTO referees
         (referee_id, name, short_name, slug, country_alpha2, country_name,
          matches_total, yellow_cards_total, red_cards_total, yellow_red_cards_total,
          fetched_at, updated_at)
@@ -182,7 +182,7 @@ def upsert_referee_sqlite(db, ref: dict, fetched_at: str) -> None:
 def upsert_referee_mysql(conn, ref: dict, fetched_at: str) -> None:
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO sofascore_referees
+        INSERT INTO referees
         (referee_id, name, short_name, slug, country_alpha2, country_name,
          matches_total, yellow_cards_total, red_cards_total, yellow_red_cards_total,
          fetched_at, updated_at)

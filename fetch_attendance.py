@@ -90,7 +90,7 @@ def parse_attendance(raw: str | None) -> int | None:
 
 def ensure_tables_sqlite(conn: sqlite3.Connection) -> None:
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS sofascore_attendance_fetch_log (
+        CREATE TABLE IF NOT EXISTS fetch_log (
             event_id INTEGER PRIMARY KEY,
             fetched_at TEXT,
             status_code INTEGER,
@@ -124,7 +124,7 @@ def save_state(path: Path, state: dict) -> None:
 def upsert_attendance_sqlite(db, event_id: int, raw: str, attendance: int | None,
                               fetched_at: str, status_code: int, error: str) -> None:
     db.execute("""
-        INSERT OR REPLACE INTO sofascore_attendance_fetch_log
+        INSERT OR REPLACE INTO fetch_log
         (event_id, fetched_at, status_code, attendance_raw, attendance_int, error)
         VALUES (?, ?, ?, ?, ?, ?)
     """, (event_id, fetched_at, status_code, raw, attendance, error))
@@ -134,7 +134,7 @@ def upsert_attendance_mysql(conn, event_id: int, raw: str, attendance: int | Non
                                fetched_at: str, status_code: int, error: str) -> None:
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO sofascore_attendance_fetch_log
+        INSERT INTO fetch_log
         (event_id, fetched_at, status_code, attendance_raw, attendance_int, error)
         VALUES (%s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
@@ -184,7 +184,7 @@ def main() -> None:
 
     if not is_mysql and args.retry_errors:
         rows = conn.execute(
-            "SELECT DISTINCT event_id FROM sofascore_attendance_fetch_log "
+            "SELECT DISTINCT event_id FROM fetch_log "
             "WHERE status_code NOT IN (200, 404) OR attendance_raw IS NULL"
         ).fetchall()
         targets = [r[0] for r in rows]

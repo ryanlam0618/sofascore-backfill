@@ -216,7 +216,7 @@ def mysql_upsert_h2h(conn, event_id, home_id, home_name, away_id, away_name,
                      cat_id, league_name, ts, h2h_data, fetched_ts):
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO sofascore_related_matches
+        INSERT INTO match_h2h
         (source_event_id, home_team_id, home_team_name, away_team_id, away_team_name,
          league_category_id, league_name, match_timestamp, home_wins, draws, away_wins,
          total_h2h, fetched_at)
@@ -239,7 +239,7 @@ def mysql_upsert_h2h(conn, event_id, home_id, home_name, away_id, away_name,
 def mysql_log_h2h(conn, event_id, fetched_ts, status_code, err):
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO sofascore_related_matches_fetch_log
+        INSERT INTO match_h2h_fetch_log
         (source_event_id, fetched_at, status_code, error)
         VALUES (%s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE fetched_at=VALUES(fetched_at)
@@ -265,7 +265,7 @@ def main():
     if is_mysql:
         conn = mysql_connect()
         ensure_mysql_tables(conn)
-        print(f"[INFO] Using MySQL (database: appdb)")
+        print(f"[INFO] Using MySQL (database: footballdata)")
     else:
         conn = sqlite3.connect(args.db)
         conn.row_factory = sqlite3.Row

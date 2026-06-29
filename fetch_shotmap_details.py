@@ -207,7 +207,7 @@ def main() -> None:
     if is_mysql:
         conn = mysql_connect()
         ensure_mysql_tables(conn)
-        print(f"[INFO] Using MySQL (database: appdb)")
+        print(f"[INFO] Using MySQL (database: footballdata)")
         db = None  # type: ignore
     else:
         db = sqlite3.connect(args.db)
@@ -225,7 +225,7 @@ def main() -> None:
         if is_mysql:
             # Read from MySQL source table
             cur = conn.cursor(dictionary=True)
-            cur.execute("SELECT event_id FROM sofascore_shotmap_xg_backfill WHERE has_shotmap=1")
+            cur.execute("SELECT event_id FROM match_shotmap WHERE has_shotmap=1")
             all_rows = cur.fetchall()
             cur.close()
             # MySQL dedup by ON DUPLICATE KEY
@@ -277,7 +277,7 @@ def main() -> None:
                     if is_mysql:
                         cur = conn.cursor()
                         cur.execute("""
-                            INSERT INTO sofascore_shotmap_details
+                            INSERT INTO match_shotmap
                             (event_id, shot_id, is_home_shot,
                              team_id, team_name,
                              player_id, player_name, player_position,
@@ -373,7 +373,7 @@ def main() -> None:
             if is_mysql:
                 cur = conn.cursor()
                 cur.execute("""
-                    INSERT INTO sofascore_shotmap_detail_events
+                    INSERT INTO fetch_log
                     (event_id, status_code, shot_count, fetched_at, error)
                     VALUES (%s, %s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE status_code=VALUES(status_code),
@@ -393,7 +393,7 @@ def main() -> None:
             if is_mysql:
                 cur = conn.cursor()
                 cur.execute("""
-                    INSERT INTO sofascore_shotmap_detail_events
+                    INSERT INTO fetch_log
                     (event_id, status_code, shot_count, fetched_at, error)
                     VALUES (%s, %s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE status_code=VALUES(status_code),

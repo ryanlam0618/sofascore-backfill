@@ -117,7 +117,7 @@ def now_mysql() -> str:
 
 def ensure_tables_sqlite(conn: sqlite3.Connection) -> None:
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS sofascore_manager_fetch_log (
+        CREATE TABLE IF NOT EXISTS fetch_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source TEXT,
             source_id TEXT,
@@ -127,7 +127,7 @@ def ensure_tables_sqlite(conn: sqlite3.Connection) -> None:
         )
     """)
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS sofascore_managers (
+        CREATE TABLE IF NOT EXISTS managers (
             manager_id INTEGER PRIMARY KEY,
             name TEXT,
             short_name TEXT,
@@ -166,7 +166,7 @@ def save_state(path: Path, state: dict) -> None:
 
 def upsert_manager_sqlite(db, mgr: dict, fetched_at: str) -> None:
     db.execute("""
-        INSERT OR REPLACE INTO sofascore_managers
+        INSERT OR REPLACE INTO managers
         (manager_id, name, short_name, slug, country_alpha2, country_name,
          birth_date, age, active_team_id, active_team_name, fetched_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -182,7 +182,7 @@ def upsert_manager_sqlite(db, mgr: dict, fetched_at: str) -> None:
 def upsert_manager_mysql(conn, mgr: dict, fetched_at: str) -> None:
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO sofascore_managers
+        INSERT INTO managers
         (manager_id, name, short_name, slug, country_alpha2, country_name,
          birth_date, age, active_team_id, active_team_name, fetched_at, updated_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)

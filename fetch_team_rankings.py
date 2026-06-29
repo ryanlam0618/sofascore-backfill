@@ -191,7 +191,7 @@ def upsert_ranking_sqlite(db, row: dict, fetched_at: str) -> None:
 def upsert_ranking_mysql(conn, row: dict, fetched_at: str) -> None:
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO sofascore_team_rankings
+        INSERT INTO team_rankings
         (team_id, team_name, team_slug, year, ranking_type, ranking_type_name,
          ranking, points, ranking_class, fetched_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -353,7 +353,7 @@ def main() -> None:
         if is_mysql:
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO sofascore_team_ranking_fetch_log
+                INSERT INTO fetch_log
                 (team_id, team_slug, fetched_at, status_code, row_count, ranking_types, error)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE

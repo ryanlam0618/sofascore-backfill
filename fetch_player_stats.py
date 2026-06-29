@@ -334,7 +334,7 @@ def fetch_top_players_with_stats(ut_id, season_id, stat_type, get_stats=False):
 def mysql_upsert_player_stat(conn, category_id, ut_id, season_id, stat_type, r, fetched_ts):
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO sofascore_player_season_stats
+        INSERT INTO player_season_stats
         (category_id, ut_id, season_id, stat_type, `rank`, player_id, player_name,
          player_position, team_id, team_name, goals, assists, appearances,
          minutes_played, xg, xa, yellow_cards, red_cards, fetched_at)
@@ -369,7 +369,7 @@ def mysql_upsert_player_stat(conn, category_id, ut_id, season_id, stat_type, r, 
 def mysql_log_player_stats(conn, category_id, ut_id, season_id, stat_type, fetched_ts, status_code, local_rows, err):
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO sofascore_player_stats_fetch_log
+        INSERT INTO fetch_log
         (category_id, ut_id, season_id, stat_type, fetched_at, status_code, player_count, error)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE fetched_at=VALUES(fetched_at)
@@ -402,7 +402,7 @@ def main():
     if is_mysql:
         conn = mysql_connect()
         ensure_mysql_tables(conn)
-        print(f"[INFO] Using MySQL (database: appdb)")
+        print(f"[INFO] Using MySQL (database: footballdata)")
     else:
         conn = sqlite3.connect(args.db)
         conn.row_factory = sqlite3.Row

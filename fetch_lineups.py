@@ -275,7 +275,7 @@ def upsert_lineup_player_mysql(conn, event_id, is_home, team_id, team_name,
                                 jersey_number, captain, player_key, fetched_ts):
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO sofascore_lineups
+        INSERT INTO match_lineups
         (event_id, is_home, team_id, team_name, player_id, player_name,
          position, position_type, jersey_number, captain, player_key, fetched_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -336,7 +336,7 @@ def main() -> None:
     if is_mysql:
         conn = mysql_connect()
         ensure_mysql_tables(conn)
-        print(f"[INFO] Using MySQL (database: appdb)")
+        print(f"[INFO] Using MySQL (database: footballdata)")
         db = None  # type: ignore
     else:
         db = sqlite3.connect(args.db)
@@ -398,12 +398,12 @@ def main() -> None:
         if args.retry_403:
             # For MySQL, need to use a direct query too
             cur = conn.cursor()
-            cur.execute("SELECT event_id FROM sofascore_lineup_events WHERE status_code = 403")
+            cur.execute("SELECT event_id FROM fetch_log WHERE status_code = 403")
             targets = [r[0] for r in cur.fetchall()]
             cur.close()
         elif args.retry_errors:
             cur = conn.cursor()
-            cur.execute("SELECT event_id FROM sofascore_lineup_events WHERE status_code NOT IN (200, 404)")
+            cur.execute("SELECT event_id FROM fetch_log WHERE status_code NOT IN (200, 404)")
             targets = [r[0] for r in cur.fetchall()]
             cur.close()
         # else: normal mode — use season targets as-is
@@ -487,7 +487,7 @@ def main() -> None:
                 if is_mysql:
                     cur = conn.cursor()
                     cur.execute("""
-                        INSERT INTO sofascore_lineup_events
+                        INSERT INTO fetch_log
                         (event_id, status_code, home_count, away_count, confirmed, fetched_at, error)
                         VALUES (%s, %s, %s, %s, %s, %s, %s)
                         ON DUPLICATE KEY UPDATE status_code=VALUES(status_code),
@@ -508,7 +508,7 @@ def main() -> None:
                 if is_mysql:
                     cur = conn.cursor()
                     cur.execute("""
-                        INSERT INTO sofascore_lineup_events
+                        INSERT INTO fetch_log
                         (event_id, status_code, home_count, away_count, confirmed, fetched_at, error)
                         VALUES (%s, %s, %s, %s, %s, %s, %s)
                         ON DUPLICATE KEY UPDATE status_code=VALUES(status_code),
@@ -528,7 +528,7 @@ def main() -> None:
                 if is_mysql:
                     cur = conn.cursor()
                     cur.execute("""
-                        INSERT INTO sofascore_lineup_events
+                        INSERT INTO fetch_log
                         (event_id, status_code, home_count, away_count, confirmed, fetched_at, error)
                         VALUES (%s, %s, %s, %s, %s, %s, %s)
                         ON DUPLICATE KEY UPDATE status_code=VALUES(status_code),
@@ -561,7 +561,7 @@ def main() -> None:
             if is_mysql:
                 cur = conn.cursor()
                 cur.execute("""
-                    INSERT INTO sofascore_lineup_events
+                    INSERT INTO fetch_log
                     (event_id, status_code, home_count, away_count, confirmed, fetched_at, error)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE status_code=VALUES(status_code),

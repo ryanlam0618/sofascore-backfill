@@ -217,7 +217,7 @@ def main() -> None:
     if is_mysql:
         conn = mysql_connect()
         ensure_mysql_tables(conn)
-        print(f"[INFO] Using MySQL (database: appdb)")
+        print(f"[INFO] Using MySQL (database: footballdata)")
         db = None
     else:
         conn = sqlite3.connect(args.db)
@@ -348,7 +348,7 @@ def main() -> None:
         if is_mysql:
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO sofascore_shotmap_xg_backfill
+                INSERT INTO match_shotmap
                 (event_id, status_code, has_shotmap, has_xg,
                  shot_count, home_shotmap_xg, away_shotmap_xg, fetched_at, error)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)

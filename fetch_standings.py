@@ -252,7 +252,7 @@ def fetch_standings(category_id, season_id, standing_type):
 def mysql_upsert_standings(conn, category_id, season_id, standing_type, tournament_name, r, fetched_ts):
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO sofascore_standings
+        INSERT INTO standings
         (category_id, tournament_name, season_id, standing_type, position,
          team_id, team_name, team_short_name, played, wins, draws, losses,
          goals_for, goals_against, goal_diff, points, last_5, streak, fetched_at)
@@ -289,7 +289,7 @@ def mysql_upsert_standings(conn, category_id, season_id, standing_type, tourname
 def mysql_log_standings(conn, category_id, season_id, standing_type, tournament_name, fetched_ts, status_code, local_rows, err):
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO sofascore_standings_fetch_log
+        INSERT INTO standings_fetch_log
         (category_id, season_id, standing_type, tournament_name, fetched_at, status_code, row_count, error)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE fetched_at=VALUES(fetched_at)
@@ -315,7 +315,7 @@ def main():
     if is_mysql:
         conn = mysql_connect()
         ensure_mysql_tables(conn)
-        print(f"[INFO] Using MySQL (database: appdb)")
+        print(f"[INFO] Using MySQL (database: footballdata)")
     else:
         conn = sqlite3.connect(args.db)
         conn.row_factory = sqlite3.Row

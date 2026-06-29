@@ -284,7 +284,7 @@ def main() -> None:
     if is_mysql:
         conn = mysql_connect()
         ensure_mysql_tables(conn)
-        print(f"[INFO] Using MySQL (database: appdb)")
+        print(f"[INFO] Using MySQL (database: footballdata)")
         db = None  # type: ignore
     else:
         db = sqlite3.connect(args.db)
@@ -363,7 +363,7 @@ def main() -> None:
                     if is_mysql:
                         cur = conn.cursor()
                         cur.execute("""
-                            INSERT INTO sofascore_incidents
+                            INSERT INTO match_incidents
                             (event_id, incident_id, match_date, league, home_team, away_team,
                              incident_type, minute, added_time, time_seconds, period_time_seconds,
                              is_home_incident, team_id, team_name,
@@ -466,7 +466,7 @@ def main() -> None:
             if is_mysql:
                 cur = conn.cursor()
                 cur.execute("""
-                    INSERT INTO sofascore_incident_events
+                    INSERT INTO fetch_log
                     (event_id, match_date, league, home_team, away_team, status_code, incident_count, fetched_at, error)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE
@@ -489,7 +489,7 @@ def main() -> None:
             if is_mysql:
                 cur = conn.cursor()
                 cur.execute("""
-                    INSERT INTO sofascore_incident_events
+                    INSERT INTO fetch_log
                     (event_id, match_date, league, home_team, away_team, status_code, incident_count, fetched_at, error)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE

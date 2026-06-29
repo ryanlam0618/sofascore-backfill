@@ -63,6 +63,12 @@ EVENT_ENDPOINTS: tuple[EndpointSpec, ...] = (
     EndpointSpec("odds_featured", "/api/v1/event/{event_id}/odds/1/featured"),
     EndpointSpec("odds_all", "/api/v1/event/{event_id}/odds/1/all"),
     EndpointSpec("provider_winning_odds", "/api/v1/event/{event_id}/provider/1/winning-odds"),
+    # Additional endpoints (added 2025-06-30)
+    EndpointSpec("shotmap", "/api/v1/event/{event_id}/shotmap"),
+    EndpointSpec("player_statistics", "/api/v1/event/{event_id}/player-statistics"),
+    EndpointSpec("momentum", "/api/v1/event/{event_id}/momentum"),
+    EndpointSpec("h2h", "/api/v1/event/{event_id}/h2h"),
+    EndpointSpec("tv", "/api/v1/event/{event_id}/tv"),
 )
 
 

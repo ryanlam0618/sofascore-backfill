@@ -49,7 +49,7 @@ COMPETITIONS = [
     ("J.League Cup",          101,   52,  "cup"),
     ("Emperor's Cup",         323,   52,  "cup"),
     ("Australia Cup",        1786,   34,  "cup"),
-    ("Chinese FA Cup",       None,   99,  "cup"),
+    ("Chinese FA Cup",       882,   99,  "cup"),
 ]
 
 

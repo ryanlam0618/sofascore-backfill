@@ -14,6 +14,7 @@ orchestrator can share the same behavior.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import os
 from dataclasses import dataclass
@@ -72,6 +73,105 @@ EVENT_ENDPOINTS: tuple[EndpointSpec, ...] = (
 )
 
 
+SPORT_ENDPOINTS: tuple[EndpointSpec, ...] = (
+    EndpointSpec("football_categories", "/api/v1/sport/football/categories"),
+    EndpointSpec("football_categories_all", "/api/v1/sport/football/categories/all"),
+    EndpointSpec("football_live_events", "/api/v1/sport/football/events/live"),
+    EndpointSpec("football_live_tournaments", "/api/v1/sport/football/live-tournaments"),
+    EndpointSpec("football_scheduled_events", "/api/v1/sport/football/scheduled-events/{date}"),
+    EndpointSpec("football_scheduled_tournaments_page", "/api/v1/sport/football/scheduled-tournaments/{date}/page/{page}"),
+    EndpointSpec("sport_event_count", "/api/v1/sport/{sport_id}/event-count"),
+    EndpointSpec("newly_added_events", "/api/v1/event/newly-added-events"),
+)
+
+CONFIG_ENDPOINTS: tuple[EndpointSpec, ...] = (
+    EndpointSpec("country_sport_priorities_country", "/api/v1/config/country-sport-priorities/country"),
+    EndpointSpec("country_sport_priorities_country_code", "/api/v1/config/country-sport-priorities/country/{cc}"),
+    EndpointSpec("default_unique_tournaments", "/api/v1/config/default-unique-tournaments/{cc}/football"),
+    EndpointSpec("unique_tournaments_en_football", "/api/v1/config/unique-tournaments/en/football"),
+)
+
+TOURNAMENT_ENDPOINTS: tuple[EndpointSpec, ...] = (
+    EndpointSpec("unique_tournament_featured_events", "/api/v1/unique-tournament/{tournament_id}/featured-events"),
+    EndpointSpec("unique_tournament_media", "/api/v1/unique-tournament/{tournament_id}/media"),
+    EndpointSpec("unique_tournament_scheduled_events", "/api/v1/unique-tournament/{tournament_id}/scheduled-events/{date}"),
+    EndpointSpec("unique_tournament_season_cuptrees", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/cuptrees"),
+    EndpointSpec("unique_tournament_season_editors", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/editors"),
+    EndpointSpec("unique_tournament_events_last", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/events/last/{n}"),
+    EndpointSpec("unique_tournament_events_next", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/events/next/{n}"),
+    EndpointSpec("unique_tournament_events_round", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/events/round/{round}"),
+    EndpointSpec("unique_tournament_groups", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/groups"),
+    EndpointSpec("unique_tournament_info", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/info"),
+    EndpointSpec("unique_tournament_player_of_season", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/player-of-the-season"),
+    EndpointSpec("unique_tournament_player_of_season_race", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/player-of-the-season-race"),
+    EndpointSpec("unique_tournament_player_statistics_types", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/player-statistics/types"),
+    EndpointSpec("unique_tournament_power_rankings_round", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/power-rankings/round/{round}"),
+    EndpointSpec("unique_tournament_power_rankings_rounds", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/power-rankings/rounds"),
+    EndpointSpec("unique_tournament_rounds", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/rounds"),
+    EndpointSpec("unique_tournament_standings_home", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/standings/home"),
+    EndpointSpec("unique_tournament_standings_total", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/standings/total"),
+    EndpointSpec("unique_tournament_statistics_info", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/statistics/info"),
+    EndpointSpec("unique_tournament_team_events_total", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/team-events/total"),
+    EndpointSpec("unique_tournament_team_of_periods_rated", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/team-of-the-period/periods/rated"),
+    EndpointSpec("unique_tournament_team_statistics_types", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/team-statistics/types"),
+    EndpointSpec("unique_tournament_team_performance_graph", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/team/{team_id}/team-performance-graph-data"),
+    EndpointSpec("unique_tournament_top_teams_overall", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/top-teams/overall"),
+    EndpointSpec("unique_tournament_trending_top_players", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/trending-top-players"),
+    EndpointSpec("unique_tournament_venues", "/api/v1/unique-tournament/{tournament_id}/season/{season_id}/venues"),
+    EndpointSpec("unique_tournament_seasons", "/api/v1/unique-tournament/{tournament_id}/seasons"),
+    EndpointSpec("tournament_scheduled_events", "/api/v1/tournament/{tournament_id}/scheduled-events/{date}"),
+    EndpointSpec("tournament_standings_home", "/api/v1/tournament/{tournament_id}/season/{season_id}/standings/home"),
+    EndpointSpec("tournament_standings_total", "/api/v1/tournament/{tournament_id}/season/{season_id}/standings/total"),
+    EndpointSpec("tournament_team_events_total", "/api/v1/tournament/{tournament_id}/season/{season_id}/team-events/total"),
+)
+
+TEAM_ENDPOINTS: tuple[EndpointSpec, ...] = (
+    EndpointSpec("team_achievements", "/api/v1/team/{team_id}/achievements"),
+    EndpointSpec("team_events_last", "/api/v1/team/{team_id}/events/last/{n}"),
+    EndpointSpec("team_events_next", "/api/v1/team/{team_id}/events/next/{n}"),
+    EndpointSpec("team_featured_event", "/api/v1/team/{team_id}/featured-event"),
+    EndpointSpec("team_featured_players", "/api/v1/team/{team_id}/featured-players"),
+    EndpointSpec("team_media_summary", "/api/v1/team/{team_id}/media/summary/country/{cc}"),
+    EndpointSpec("team_media_videos", "/api/v1/team/{team_id}/media/videos"),
+    EndpointSpec("team_official_tweets", "/api/v1/team/{team_id}/official-tweets"),
+    EndpointSpec("team_performance", "/api/v1/team/{team_id}/performance"),
+    EndpointSpec("team_player_statistics_seasons", "/api/v1/team/{team_id}/player-statistics/seasons"),
+    EndpointSpec("team_season_best_result", "/api/v1/team/{team_id}/season/{season_id}/best-result"),
+    EndpointSpec("team_standings_seasons", "/api/v1/team/{team_id}/standings/seasons"),
+    EndpointSpec("team_team_statistics_seasons", "/api/v1/team/{team_id}/team-statistics/seasons"),
+    EndpointSpec("team_ranks_overall", "/api/v1/team/{team_id}/unique-tournament/{tournament_id}/season/{season_id}/ranks/overall"),
+    EndpointSpec("team_statistics_overall", "/api/v1/team/{team_id}/unique-tournament/{tournament_id}/season/{season_id}/statistics/overall"),
+    EndpointSpec("team_top_players_overall", "/api/v1/team/{team_id}/unique-tournament/{tournament_id}/season/{season_id}/top-players/overall"),
+    EndpointSpec("team_unique_tournaments_all", "/api/v1/team/{team_id}/unique-tournaments/all"),
+    EndpointSpec("team_year_statistics", "/api/v1/team/{team_id}/year-statistics/{year}"),
+)
+
+PLAYER_ENDPOINTS: tuple[EndpointSpec, ...] = (
+    EndpointSpec("player_attribute_overviews", "/api/v1/player/{player_id}/attribute-overviews"),
+)
+
+MISC_ENDPOINTS: tuple[EndpointSpec, ...] = (
+    EndpointSpec("country_alpha2", "/api/v1/country/alpha2"),
+    EndpointSpec("tv_country_channels", "/api/v1/tv/event/{event_id}/country-channels"),
+    EndpointSpec("fantasy_event", "/api/v1/fantasy/event/{event_id}"),
+    EndpointSpec("team_of_the_period", "/api/v1/team-of-the-period/{team_of_period_id}"),
+    EndpointSpec("translation_description", "/api/v1/translation/description/{description_id}/language/en"),
+    EndpointSpec("odds_providers_web", "/api/v1/odds/providers/{cc}/web"),
+    EndpointSpec("odds_providers_web_featured", "/api/v1/odds/providers/{cc}/web-featured"),
+    EndpointSpec("odds_providers_web_odds", "/api/v1/odds/providers/{cc}/web-odds"),
+    EndpointSpec("odds_featured_events_football", "/api/v1/odds/{odds_id}/featured-events/football"),
+    EndpointSpec("offers_banner_team", "/api/v1/offers/banner/team/{team_id}/{cc}/en"),
+    EndpointSpec("sofascore_news_event_posts", "/api/v1/sofascore-news/en/event/{event_id}/posts/{post_id}"),
+    EndpointSpec("sofascore_news_posts", "/api/v1/sofascore-news/en/posts"),
+    EndpointSpec("sofascore_news_team_posts", "/api/v1/sofascore-news/en/team/{team_id}/posts/{post_id}"),
+    EndpointSpec("sofascore_news_tournament_posts", "/api/v1/sofascore-news/en/tournament/{tournament_id}/posts/{post_id}"),
+    EndpointSpec("branding_providers_web", "/api/v1/branding/providers/{cc}/web"),
+    EndpointSpec("event_ai_insights", "/api/v1/event/{event_id}/ai-insights/en"),
+    EndpointSpec("event_win_probability", "/api/v1/event/{event_id}/graph/win-probability"),
+    EndpointSpec("event_video_highlights_extended", "/api/v1/event/{event_id}/sport-video-highlights/country/{cc}/extended"),
+)
+
+
 class SofaScoreBrowserClient:
     """Browser-first SofaScore client."""
 
@@ -83,8 +183,7 @@ class SofaScoreBrowserClient:
         self.page = None
 
     async def __aenter__(self):
-        self._pw = async_playwright()
-        await self._pw.start()
+        self._pw = await async_playwright().start()
         self.browser = await self._pw.chromium.launch(
             headless=self.headless,
             args=[
@@ -125,6 +224,26 @@ class SofaScoreBrowserClient:
             wait_until="networkidle",
         )
 
+    async def warm_tournament_page(self, tournament_id: int, season_id: Optional[int] = None, timeout: int = 60) -> None:
+        url = f"{BROWSER_BASE}/football/unique-tournament/{tournament_id}"
+        if season_id is not None:
+            url = f"{url}/season/{season_id}"
+        await self.page.goto(url, timeout=timeout * 1000, wait_until="networkidle")
+
+    async def warm_team_page(self, team_id: int, timeout: int = 60) -> None:
+        await self.page.goto(
+            f"{BROWSER_BASE}/team/football/{team_id}",
+            timeout=timeout * 1000,
+            wait_until="networkidle",
+        )
+
+    async def warm_sport_page(self, sport: str = "football", timeout: int = 60) -> None:
+        await self.page.goto(
+            f"{BROWSER_BASE}/{sport}",
+            timeout=timeout * 1000,
+            wait_until="networkidle",
+        )
+
     async def get_ssr(self) -> Optional[dict]:
         return await self.page.evaluate(
             """
@@ -138,33 +257,129 @@ class SofaScoreBrowserClient:
     async def fetch_json(self, path: str, timeout_ms: int = 10000) -> dict:
         result = await self.page.evaluate(
             """
-            async ({ path }) => {
-              const resp = await fetch(path, { credentials: 'include' });
-              const text = await resp.text();
-              let body = text;
-              try { body = JSON.parse(text); } catch (e) {}
-              return { status: resp.status, body };
+            async ({ path, timeoutMs }) => {
+              const controller = new AbortController();
+              const timer = setTimeout(() => controller.abort(), timeoutMs);
+              try {
+                const resp = await fetch(path, {
+                  credentials: 'include',
+                  signal: controller.signal,
+                });
+                const text = await resp.text();
+                let body = text;
+                try { body = JSON.parse(text); } catch (e) {}
+                return { status: resp.status, body };
+              } finally {
+                clearTimeout(timer);
+              }
             }
             """,
-            {"path": path},
+            {"path": path, "timeoutMs": timeout_ms},
         )
         return result
 
-    async def fetch_event_bundle(self, event_id: int, endpoint_specs: Iterable[EndpointSpec] = EVENT_ENDPOINTS) -> Dict[str, Any]:
-        await self.warm_event_page(event_id)
+    def default_endpoint_params(self, **overrides: Any) -> Dict[str, Any]:
+        today = datetime.date.today()
+        params: Dict[str, Any] = {
+            "cc": "HK",
+            "date": today.isoformat(),
+            "description_id": overrides.get("event_id", 0),
+            "event_id": 0,
+            "n": 5,
+            "odds_id": 1,
+            "page": 0,
+            "player_id": 0,
+            "post_id": 0,
+            "round": 1,
+            "season_id": 0,
+            "sport": "football",
+            "sport_id": "football",
+            "team_id": 0,
+            "team_of_period_id": 0,
+            "tournament_id": 0,
+            "year": today.year,
+        }
+        params.update({key: value for key, value in overrides.items() if value is not None})
+        return params
+
+    async def fetch_endpoint_bundle(
+        self,
+        endpoint_specs: Iterable[EndpointSpec],
+        bundle_metadata: Dict[str, Any],
+        endpoint_params: Dict[str, Any],
+    ) -> Dict[str, Any]:
         bundle: Dict[str, Any] = {
-            "event_id": event_id,
+            **bundle_metadata,
             "source": "browser",
             "ssr": await self.get_ssr(),
             "apis": {},
         }
         for spec in endpoint_specs:
-            path = spec.path(event_id=event_id)
             try:
+                path = spec.path(**endpoint_params)
                 bundle["apis"][path] = await self.fetch_json(path)
             except Exception as exc:
-                bundle["apis"][path] = {"status": 0, "error": str(exc)}
+                bundle["apis"][spec.path_template] = {"status": 0, "error": str(exc)}
         return bundle
+
+    async def fetch_event_bundle(
+        self,
+        event_id: int,
+        endpoint_specs: Iterable[EndpointSpec] = EVENT_ENDPOINTS,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        await self.warm_event_page(event_id)
+        endpoint_params = self.default_endpoint_params(event_id=event_id, description_id=event_id, **kwargs)
+        return await self.fetch_endpoint_bundle(endpoint_specs, {"event_id": event_id}, endpoint_params)
+
+    async def fetch_tournament_bundle(
+        self,
+        tournament_id: int,
+        season_id: int,
+        endpoint_specs: Iterable[EndpointSpec] = TOURNAMENT_ENDPOINTS,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        await self.warm_tournament_page(tournament_id, season_id)
+        endpoint_params = self.default_endpoint_params(
+            tournament_id=tournament_id,
+            season_id=season_id,
+            **kwargs,
+        )
+        return await self.fetch_endpoint_bundle(
+            endpoint_specs,
+            {"tournament_id": tournament_id, "season_id": season_id},
+            endpoint_params,
+        )
+
+    async def fetch_team_bundle(
+        self,
+        team_id: int,
+        endpoint_specs: Iterable[EndpointSpec] = TEAM_ENDPOINTS,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        await self.warm_team_page(team_id)
+        endpoint_params = self.default_endpoint_params(team_id=team_id, **kwargs)
+        return await self.fetch_endpoint_bundle(endpoint_specs, {"team_id": team_id}, endpoint_params)
+
+    async def fetch_sport_bundle(
+        self,
+        sport: str = "football",
+        endpoint_specs: Iterable[EndpointSpec] = SPORT_ENDPOINTS,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        await self.warm_sport_page(sport)
+        endpoint_params = self.default_endpoint_params(sport=sport, sport_id=sport, **kwargs)
+        return await self.fetch_endpoint_bundle(endpoint_specs, {"sport": sport}, endpoint_params)
+
+    async def fetch_config_bundle(
+        self,
+        country_code: str = "HK",
+        endpoint_specs: Iterable[EndpointSpec] = CONFIG_ENDPOINTS,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        await self.warm_sport_page("football")
+        endpoint_params = self.default_endpoint_params(cc=country_code, **kwargs)
+        return await self.fetch_endpoint_bundle(endpoint_specs, {"country_code": country_code}, endpoint_params)
 
 
 def run_async(coro):

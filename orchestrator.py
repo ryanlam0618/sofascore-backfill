@@ -877,6 +877,8 @@ def main() -> None:
                     help="Show backfill status for all competitions")
     ap.add_argument("--check-config", action="store_true",
                     help="Validate discoveries.json and config")
+    ap.add_argument("--endpoint-catalog", action="store_true",
+                    help="Print supported SofaScore API endpoint bundles")
     ap.add_argument("--dry-run", action="store_true",
                     help="Show what would run without executing")
     ap.add_argument("--limit", type=int, default=0,
@@ -905,6 +907,12 @@ def main() -> None:
             seasons = data.get("seasons", {})
             status = "✅" if seasons else "❌"
             print(f"  {status} {name}: {len(seasons)} seasons")
+        return
+
+    if args.endpoint_catalog:
+        from endpoint_catalog import print_catalog
+
+        print_catalog()
         return
 
     if args.status:
@@ -986,7 +994,7 @@ def main() -> None:
         print("\n[DONE] All backfill jobs started")
         return
 
-    print("Usage: orchestrator.py --all | --competition NAME | --status | --check-config | --dry-run")
+    print("Usage: orchestrator.py --all | --competition NAME | --status | --check-config | --endpoint-catalog | --dry-run")
     return
 
 if __name__ == "__main__":

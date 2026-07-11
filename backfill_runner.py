@@ -428,6 +428,10 @@ class BackfillClient:
         self.page = None
         self._request_count = 0
         self._heal_count = 0
+        self._current_event_id = None
+        self._current_event_attempt = None
+        self._current_action = "idle"
+        self._last_api_path = None
 
     async def __aenter__(self):
         self._pw = await async_playwright().start()
@@ -495,9 +499,32 @@ class BackfillClient:
             or "Browser has been closed" in message
         )
 
+    def set_event_context(self, event_id: Optional[int], attempt: Optional[int], action: str = "event"):
+        self._current_event_id = event_id
+        self._current_event_attempt = attempt
+        self._current_action = action
+
+    def clear_event_context(self):
+        self._current_event_id = None
+        self._current_event_attempt = None
+        self._current_action = "idle"
+        self._last_api_path = None
+
+    def telemetry_snapshot(self) -> str:
+        return (
+            f"event={self._current_event_id} "
+            f"event_attempt={self._current_event_attempt} "
+            f"action={self._current_action} "
+            f"path={self._last_api_path} "
+            f"requests={self._request_count} heals={self._heal_count}"
+        )
+
     async def rebuild(self, *, reason: str, warm_homepage: bool = True):
         self._heal_count += 1
-        print(f"    ↻ Rebuilding browser client ({reason}) [heal #{self._heal_count}]")
+        print(
+            f"    ↻ Rebuilding browser client ({reason}) [heal #{self._heal_count}] "
+            f"[{self.telemetry_snapshot()}]"
+        )
         await self.shutdown()
         await self.__aenter__()
         if warm_homepage:
@@ -505,17 +532,21 @@ class BackfillClient:
 
     async def warm_homepage(self):
         """Load homepage to establish session cookies."""
+        self._current_action = "warm_homepage"
         await self.page.goto(f"{BROWSER_BASE}/", timeout=30000, wait_until="domcontentloaded")
         await asyncio.sleep(2)
 
     async def warm_tournament(self, ut_id: int, season_id: int):
         """Load tournament page to get API access."""
+        self._current_action = f"warm_tournament:{ut_id}/{season_id}"
         url = f"{BROWSER_BASE}/football/unique-tournament/{ut_id}/season/{season_id}"
         await self.page.goto(url, timeout=30000, wait_until="domcontentloaded")
         await asyncio.sleep(3)
 
     async def warm_event(self, event_id: int):
         """Load event page."""
+        self._current_action = "warm_event"
+        self._current_event_id = event_id
         url = f"{BROWSER_BASE}/event/{event_id}"
         await self.page.goto(url, timeout=30000, wait_until="domcontentloaded")
         await asyncio.sleep(1.5)
@@ -552,8 +583,10 @@ class BackfillClient:
 
     async def fetch_api(self, path: str, timeout_ms: int = 15000, max_retries: int = 3) -> dict:
         """Fetch a SofaScore API endpoint via page.evaluate, with retry on 403."""
+        self._last_api_path = path
         for attempt in range(max_retries):
             self._request_count += 1
+            self._current_action = f"fetch_api[{attempt+1}/{max_retries}]"
             try:
                 result = await self.page.evaluate(
                     """
@@ -580,6 +613,7 @@ class BackfillClient:
                 )
             except PlaywrightError as e:
                 if self.is_target_closed_error(e) and attempt + 1 < max_retries:
+                    print(f"    ⚠ Target closed during fetch_api: {e} [{self.telemetry_snapshot()}]")
                     await self.rebuild(reason=f"target closed during fetch_api {path}")
                     continue
                 raise
@@ -605,6 +639,7 @@ async def _process_event_with_retries(client: BackfillClient, inserter, progress
                                       *, max_attempts: int = 2) -> bool:
     last_error = None
     for attempt in range(1, max_attempts + 1):
+        client.set_event_context(eid, attempt)
         try:
             if attempt > 1:
                 print(f"    ↻ Retrying event {eid} (attempt {attempt}/{max_attempts})")
@@ -700,10 +735,12 @@ async def _process_event_with_retries(client: BackfillClient, inserter, progress
             season_stats["graph"] += graph_count
             season_stats["odds"] += odds_count
             season_stats["comments"] += comments_count
+            client.clear_event_context()
             return True
         except PlaywrightError as e:
             last_error = e
             if client.is_target_closed_error(e) and attempt < max_attempts:
+                print(f"    ⚠ Target closed while processing event {eid}: {e} [{client.telemetry_snapshot()}]")
                 await client.rebuild(reason=f"target closed while processing event {eid}")
                 continue
             break
@@ -711,9 +748,10 @@ async def _process_event_with_retries(client: BackfillClient, inserter, progress
             last_error = e
             break
 
-    print(f"    ❌ Event {eid} error: {last_error}")
+    print(f"    ❌ Event {eid} error: {last_error} [{client.telemetry_snapshot()}]")
     progress.mark_failed(eid, str(last_error))
     season_stats["failed"] += 1
+    client.clear_event_context()
     return False
 
 

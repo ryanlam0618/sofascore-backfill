@@ -38,11 +38,12 @@ competitions:
 
   - name: Bundesliga
     category_id: 30
-    ut_id: 9
+    ut_id: 35
     cat_country: Germany
     season_mode: national
     season_id_2024_25: null
     status: discovered
+    notes: "ut_id corrected 2026-07-02: 9 is Challenger Pro League (Belgium), 35 is Bundesliga (Germany)"
 
   - name: Ligue 1
     category_id: 7
@@ -111,6 +112,14 @@ competitions:
     season_mode: international
     status: discovered
 
+  - name: AFC Champions League Two
+    category_id: 1467
+    ut_id: 668
+    cat_country: asia
+    season_mode: international
+    status: discovered
+    notes: "Formerly AFC Cup, rebranded 2024-25"
+
   # ── Domestic Cups ─────────────────────────────────────────────────────────
   - name: FA Cup
     category_id: 1
@@ -177,8 +186,8 @@ competitions:
 
   - name: Chinese FA Cup
     category_id: 99
-    ut_id: null
+    ut_id: 882
     cat_country: China
     season_mode: cup
-    status: blocked
-    notes: "ut_id unknown — cannot discover seasons"
+    status: discovered
+    notes: "ut_id 882 confirmed via API 2026-07-01, name: CFA Cup"

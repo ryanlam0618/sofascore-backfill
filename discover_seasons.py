@@ -2,11 +2,11 @@
 """
 SofaScore Season Discovery
 ==========================
-Discovers valid season IDs for ALL 23 competitions using:
+Discovers valid season IDs for ALL 24 competitions using:
   GET /unique-tournament/{ut_id}/seasons
 
 This is the WORKING endpoint for season discovery.
-Confirmed: 2026-05-04 - all 22 competitions return valid season lists.
+Updated: 2026-07-19 - config tracks 24 competitions including AFC Champions League Two.
 
 Also tests event endpoints to verify backfill compatibility.
 
@@ -25,12 +25,12 @@ WORKDIR = Path(__file__).parent
 OUT_FILE = WORKDIR / "discoveries.json"
 
 
-# All 23 competitions with known uniqueTournament IDs
+# All 24 competitions with known uniqueTournament IDs
 COMPETITIONS = [
     ("Premier League",          17,    1,  "national"),
     ("La Liga",                 8,   32,  "national"),
     ("Serie A",                23,   31,  "national"),
-    ("Bundesliga",              9,   30,  "national"),
+    ("Bundesliga",             35,   30,  "national"),   # ut_id=35 (NOT 9 — 9 is Challenger Pro League Belgium)
     ("Ligue 1",                34,    7,  "national"),
     ("J1 League",             196,   52,  "national"),
     ("K League 1",            410,  291,  "national"),
@@ -40,6 +40,7 @@ COMPETITIONS = [
     ("UEL",                   679, 1465,  "uefa"),
     ("UECL",               17015, 1465,  "uefa"),
     ("AFC Champions League",   463, 1467,  "uefa"),
+    ("AFC Champions League Two", 668, 1467,  "international"),
     ("FA Cup",                 19,    1,  "cup"),
     ("EFL Cup",                21,    1,  "cup"),
     ("Copa del Rey",          329,   32,  "cup"),
@@ -154,7 +155,7 @@ def discover_competition(name: str, ut_id: int | None, cat_id: int, mode: str) -
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="SofaScore Season Discovery")
-    ap.add_argument("--all", action="store_true", help="Discover all 23 competitions")
+    ap.add_argument("--all", action="store_true", help="Discover all 24 competitions")
     ap.add_argument("--name", type=str, help="Discover one competition by name")
     ap.add_argument("--check-events", action="store_true", help="Also test events endpoints")
     ap.add_argument("--output", default=str(OUT_FILE), help="Output file")

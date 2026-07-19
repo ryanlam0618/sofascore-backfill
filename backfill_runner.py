@@ -32,7 +32,11 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _first_non_empty(*values):
@@ -63,6 +67,34 @@ def _normalize_preferred_foot(value: Optional[str]) -> Optional[str]:
         "either": "both",
     }
     return mapping.get(value)
+
+
+def _normalize_match_status(value: Any) -> str:
+    raw = str(value or "scheduled").strip().lower()
+    mapping = {
+        "notstarted": "scheduled",
+        "scheduled": "scheduled",
+        "fixture": "scheduled",
+        "pending": "scheduled",
+        "inprogress": "live",
+        "live": "live",
+        "1h": "live",
+        "2h": "live",
+        "ht": "live",
+        "et": "live",
+        "finished": "finished",
+        "afteret": "finished",
+        "afterpens": "finished",
+        "ft": "finished",
+        "postponed": "postponed",
+        "delayed": "postponed",
+        "canceled": "postponed",
+        "cancelled": "postponed",
+        "abandoned": "postponed",
+        "suspended": "postponed",
+        "interrupted": "postponed",
+    }
+    return mapping.get(raw, "scheduled")
 
 
 def _parse_date_value(value: Any) -> Optional[str]:
@@ -162,6 +194,8 @@ DISCOVERIES_FILE = WORKDIR / "discoveries.json"
 COMPETITIONS_FILE = WORKDIR / "competitions_10y.yaml"
 DATA_DIR = WORKDIR / "data" / "backfill_sofascore_10y"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+STATUS_DIR = WORKDIR / "logs"
+STATUS_DIR.mkdir(parents=True, exist_ok=True)
 
 BROWSER_BASE = "https://www.sofascore.com"
 API_BASE = "https://www.sofascore.com/api/v1"
@@ -216,6 +250,8 @@ PROXY_SERVER = os.getenv("SOFA_PROXY_HOST", "p.webshare.io")
 PROXY_PORT = os.getenv("SOFA_PROXY_PORT", "80")
 PROXY_USER = os.getenv("SOFA_PROXY_USER", "aeptenjc-rotate")
 PROXY_PASS = os.getenv("SOFA_PROXY_PASS", "")
+PROXY_SESSION_PREFIX = os.getenv("SOFA_PROXY_SESSION_PREFIX", "sofa")
+PROXY_STICKY_MINUTES = int(os.getenv("SOFA_PROXY_STICKY_MINUTES", "15"))
 
 # Load .env
 load_dotenv(WORKDIR / ".env")
@@ -226,6 +262,58 @@ DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 )
+
+CORE_ENDPOINTS: Sequence[str] = ("event", "incidents", "lineups")
+MID_RISK_ENDPOINTS: Sequence[str] = ("statistics", "shotmap")
+HIGH_RISK_ENDPOINTS: Sequence[str] = ("graph", "odds", "comments")
+
+ENDPOINT_PATHS = {
+    "event": "/api/v1/event/{event_id}",
+    "incidents": "/api/v1/event/{event_id}/incidents",
+    "lineups": "/api/v1/event/{event_id}/lineups",
+    "statistics": "/api/v1/event/{event_id}/statistics",
+    "shotmap": "/api/v1/event/{event_id}/shotmap",
+    "graph": "/api/v1/event/{event_id}/graph",
+    "odds": "/api/v1/event/{event_id}/odds/1/all",
+    "comments": "/api/v1/event/{event_id}/comments",
+}
+
+PHASE_SLEEP_RANGES = {
+    "core": (1.2, 2.4),
+    "mid": (3.0, 5.0),
+    "high": (5.5, 9.0),
+}
+
+ENDPOINT_PHASE = {
+    "event": "core",
+    "incidents": "core",
+    "lineups": "core",
+    "statistics": "mid",
+    "shotmap": "mid",
+    "graph": "high",
+    "odds": "high",
+    "comments": "high",
+}
+
+ENDPOINT_FETCH_LOG_TABLE = {
+    "incidents": "match_incidents",
+    "lineups": "match_lineups",
+    "statistics": "match_statistics",
+    "shotmap": "match_shotmap",
+    "graph": "match_graph_points",
+    "odds": "match_odds",
+    "comments": "match_comments",
+}
+
+ENDPOINT_COUNTER_KEY = {
+    "incidents": "incidents",
+    "lineups": "lineups",
+    "statistics": "statistics",
+    "shotmap": "shotmap",
+    "graph": "graph",
+    "odds": "odds",
+    "comments": "comments",
+}
 
 # ── MySQL ─────────────────────────────────────────────────────────────────────
 
@@ -420,38 +508,41 @@ class ProgressTracker:
 class BackfillClient:
     """Playwright browser client with proxy, for backfill operations."""
 
-    def __init__(self, headless: bool = True):
+    def __init__(self, headless: bool = True, sticky_session_key: Optional[str] = None):
         self.headless = headless
+        self.sticky_session_key = sticky_session_key
         self._pw = None
         self.browser = None
         self.context = None
         self.page = None
+        self.api_page = None
         self._request_count = 0
         self._heal_count = 0
         self._current_event_id = None
         self._current_event_attempt = None
         self._current_action = "idle"
         self._last_api_path = None
+        self._consecutive_403 = 0
+        self._response_cache = {}
+        self._response_waiters = {}
+        self._network_capture_enabled = True
 
     async def __aenter__(self):
         self._pw = await async_playwright().start()
+        launch_args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--window-size=1920,1080",
+            "--disable-blink-features=AutomationControlled",
+        ]
+        if self.headless:
+            launch_args.append("--headless=new")
         self.browser = await self._pw.chromium.launch(
             headless=self.headless,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--window-size=1920,1080",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=launch_args,
         )
-        proxy_config = None
-        if PROXY_SERVER:
-            proxy_config = {
-                "server": f"http://{PROXY_SERVER}:{PROXY_PORT}",
-                "username": PROXY_USER,
-                "password": PROXY_PASS,
-            }
+        proxy_config = self._build_proxy_config()
         self.context = await self.browser.new_context(
             viewport={"width": 1920, "height": 1080},
             user_agent=DEFAULT_UA,
@@ -459,12 +550,87 @@ class BackfillClient:
             extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
         )
         self.page = await self.context.new_page()
+        self.api_page = await self.context.new_page()
+        self._wire_network_capture()
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
         await self.shutdown()
 
+    def _build_proxy_config(self):
+        if not PROXY_SERVER:
+            return None
+        username = PROXY_USER
+        return {
+            "server": f"http://{PROXY_SERVER}:{PROXY_PORT}",
+            "username": username,
+            "password": PROXY_PASS,
+        }
+
+    def _wire_network_capture(self):
+        self._response_cache = {}
+        self._response_waiters = {}
+        if not self.context:
+            return
+
+        async def handle_response(response):
+            try:
+                url = response.url
+                if not url.startswith(BROWSER_BASE + "/api/v1/"):
+                    return
+                path = url[len(BROWSER_BASE):]
+                payload = {"status": response.status, "body": None}
+                try:
+                    payload["body"] = await response.json()
+                except Exception as json_error:
+                    payload["error"] = str(json_error)
+                    try:
+                        payload["body"] = await response.text()
+                    except Exception:
+                        payload["body"] = None
+                self._response_cache[path] = payload
+                waiter = self._response_waiters.pop(path, None)
+                if waiter and not waiter.done():
+                    waiter.set_result(payload)
+            except Exception:
+                return
+
+        self.context.on("response", handle_response)
+
+    async def _humanize_page(self):
+        if not self.page:
+            return
+        try:
+            await self.page.mouse.move(random.randint(150, 600), random.randint(120, 420), steps=random.randint(8, 20))
+            await asyncio.sleep(random.uniform(0.2, 0.7))
+            for _ in range(random.randint(1, 2)):
+                await self.page.mouse.wheel(0, random.randint(250, 700))
+                await asyncio.sleep(random.uniform(0.4, 1.2))
+            if random.random() < 0.35:
+                await self.page.mouse.wheel(0, -random.randint(120, 300))
+                await asyncio.sleep(random.uniform(0.2, 0.6))
+        except Exception:
+            return
+
+    async def _wait_for_captured_response(self, path: str, timeout_ms: int = 10000):
+        if path in self._response_cache:
+            return self._response_cache[path]
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._response_waiters[path] = fut
+        try:
+            return await asyncio.wait_for(fut, timeout_ms / 1000)
+        except asyncio.TimeoutError:
+            self._response_waiters.pop(path, None)
+            return None
+
     async def shutdown(self):
+        if self.api_page:
+            try:
+                await self.api_page.close()
+            except Exception:
+                pass
+            self.api_page = None
         if self.page:
             try:
                 await self.page.close()
@@ -497,6 +663,39 @@ class BackfillClient:
             "Target page, context or browser has been closed" in message
             or "Target closed" in message
             or "Browser has been closed" in message
+        )
+
+    @staticmethod
+    def is_transport_closed_error(exc: Exception) -> bool:
+        message = str(exc)
+        lowered = message.lower()
+        return (
+            "write epipe" in lowered
+            or "econnreset" in lowered
+            or "connection closed" in lowered
+            or "pipe closed" in lowered
+            or "transport closed" in lowered
+            or "browser closed" in lowered
+            or ("driver" in lowered and "closed" in lowered)
+        )
+
+    @staticmethod
+    def is_navigation_context_error(exc: Exception) -> bool:
+        message = str(exc)
+        lowered = message.lower()
+        return (
+            "execution context was destroyed" in lowered
+            or "interrupted by another navigation" in lowered
+            or "frame was detached" in lowered
+            or "cannot find context with specified id" in lowered
+            or ("navigation" in lowered and "interrupted" in lowered)
+        )
+
+    def is_recoverable_browser_error(self, exc: Exception) -> bool:
+        return (
+            self.is_target_closed_error(exc)
+            or self.is_transport_closed_error(exc)
+            or self.is_navigation_context_error(exc)
         )
 
     def set_event_context(self, event_id: Optional[int], attempt: Optional[int], action: str = "event"):
@@ -533,26 +732,69 @@ class BackfillClient:
     async def warm_homepage(self):
         """Load homepage to establish session cookies."""
         self._current_action = "warm_homepage"
-        await self.page.goto(f"{BROWSER_BASE}/", timeout=30000, wait_until="domcontentloaded")
-        await asyncio.sleep(2)
+        for attempt in range(2):
+            try:
+                print(f"    ↳ warm_homepage attempt {attempt+1}/2 [{self.telemetry_snapshot()}]")
+                await self.page.goto(f"{BROWSER_BASE}/", timeout=30000, wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+                await self._humanize_page()
+                print(f"    ↳ warm_homepage ok [{self.telemetry_snapshot()}]")
+                return
+            except PlaywrightError as e:
+                if self.is_recoverable_browser_error(e) and attempt == 0:
+                    print(f"    ⚠ Browser transport issue during warm_homepage: {e} [{self.telemetry_snapshot()}]")
+                    await self.rebuild(reason="browser transport issue during warm_homepage", warm_homepage=False)
+                    continue
+                raise
 
     async def warm_tournament(self, ut_id: int, season_id: int):
         """Load tournament page to get API access."""
         self._current_action = f"warm_tournament:{ut_id}/{season_id}"
         url = f"{BROWSER_BASE}/football/unique-tournament/{ut_id}/season/{season_id}"
-        await self.page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        await asyncio.sleep(3)
+        for attempt in range(2):
+            try:
+                self._response_cache = {}
+                print(f"    ↳ warm_tournament {ut_id}/{season_id} attempt {attempt+1}/2 [{self.telemetry_snapshot()}]")
+                await self.page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                await asyncio.sleep(3)
+                await self._humanize_page()
+                print(f"    ↳ warm_tournament {ut_id}/{season_id} ok [{self.telemetry_snapshot()}]")
+                return
+            except PlaywrightError as e:
+                if self.is_recoverable_browser_error(e) and attempt == 0:
+                    print(f"    ⚠ Browser transport issue during warm_tournament: {e} [{self.telemetry_snapshot()}]")
+                    await self.rebuild(reason=f"browser transport issue during warm_tournament {ut_id}/{season_id}")
+                    continue
+                raise
 
     async def warm_event(self, event_id: int):
         """Load event page."""
         self._current_action = "warm_event"
         self._current_event_id = event_id
         url = f"{BROWSER_BASE}/event/{event_id}"
-        await self.page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        await asyncio.sleep(1.5)
+        for attempt in range(2):
+            try:
+                self._response_cache = {}
+                print(f"    ↳ warm_event {event_id} attempt {attempt+1}/2 [{self.telemetry_snapshot()}]")
+                await self.page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                await asyncio.sleep(1.5)
+                await self._humanize_page()
+                print(f"    ↳ warm_event {event_id} ok [{self.telemetry_snapshot()}]")
+                return
+            except PlaywrightError as e:
+                if self.is_recoverable_browser_error(e) and attempt == 0:
+                    print(f"    ⚠ Browser transport issue during warm_event {event_id}: {e} [{self.telemetry_snapshot()}]")
+                    await self.rebuild(reason=f"browser transport issue during warm_event {event_id}")
+                    continue
+                raise
 
     async def rotate_context(self):
-        """Create a fresh browser context to get a new rotating-proxy IP."""
+        """Create a fresh browser context; sticky sessions keep the same IP/session unless session key changes."""
+        if self.api_page:
+            try:
+                await self.api_page.close()
+            except Exception:
+                pass
         if self.page:
             try:
                 await self.page.close()
@@ -564,13 +806,7 @@ class BackfillClient:
             except Exception:
                 pass
 
-        proxy_config = None
-        if PROXY_SERVER:
-            proxy_config = {
-                "server": f"http://{PROXY_SERVER}:{PROXY_PORT}",
-                "username": PROXY_USER,
-                "password": PROXY_PASS,
-            }
+        proxy_config = self._build_proxy_config()
         self.context = await self.browser.new_context(
             viewport={"width": 1920, "height": 1080},
             user_agent=DEFAULT_UA,
@@ -578,76 +814,188 @@ class BackfillClient:
             extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
         )
         self.page = await self.context.new_page()
-        # Re-warm homepage on the new context so cookies are set
+        self.api_page = await self.context.new_page()
+        self._wire_network_capture()
         await self.warm_homepage()
 
-    async def fetch_api(self, path: str, timeout_ms: int = 15000, max_retries: int = 3) -> dict:
-        """Fetch a SofaScore API endpoint via page.evaluate, with retry on 403."""
+    async def fetch_api(self, path: str, timeout_ms: int = 15000, max_retries: int = 3, prefer_capture: bool = False) -> dict:
+        """Fetch a SofaScore API endpoint, preferring network-captured browser responses when possible."""
         self._last_api_path = path
+        last_result = {"status": 0, "error": "uninitialized"}
+        print(f"    ↳ fetch_api start {path} prefer_capture={prefer_capture} timeout_ms={timeout_ms} [{self.telemetry_snapshot()}]")
+
+        if prefer_capture and self._network_capture_enabled:
+            captured = await self._wait_for_captured_response(path, timeout_ms=timeout_ms)
+            if captured is not None:
+                print(f"    ↳ capture hit for {path}: HTTP {captured.get('status')}")
+                self._consecutive_403 = 0 if captured.get("status") != 403 else self._consecutive_403 + 1
+                return captured
+            print(f"    ↳ capture miss for {path}, falling back to direct fetch")
+
         for attempt in range(max_retries):
             self._request_count += 1
             self._current_action = f"fetch_api[{attempt+1}/{max_retries}]"
             try:
-                result = await self.page.evaluate(
-                    """
-                    async ({ path, timeoutMs }) => {
-                        const controller = new AbortController();
-                        const timer = setTimeout(() => controller.abort(), timeoutMs);
-                        try {
-                            const resp = await fetch(path, {
-                                credentials: 'include',
-                                signal: controller.signal,
-                            });
-                            const text = await resp.text();
-                            let body = text;
-                            try { body = JSON.parse(text); } catch (e) {}
-                            return { status: resp.status, body };
-                        } catch (e) {
-                            return { status: 0, error: e.message };
-                        } finally {
-                            clearTimeout(timer);
-                        }
-                    }
-                    """,
-                    {"path": path, "timeoutMs": timeout_ms},
+                response = await self.api_page.goto(
+                    f"{BROWSER_BASE}{path}",
+                    timeout=timeout_ms,
+                    wait_until="commit",
                 )
+                if response is None:
+                    result = {"status": 0, "error": "no response returned"}
+                else:
+                    status = response.status
+                    body = None
+                    error = None
+                    try:
+                        body = await response.json()
+                    except Exception as json_error:
+                        error = str(json_error)
+                        try:
+                            body = await self.api_page.evaluate("() => document.body.innerText")
+                        except Exception:
+                            body = None
+                    result = {"status": status, "body": body}
+                    if error:
+                        result["error"] = error
             except PlaywrightError as e:
-                if self.is_target_closed_error(e) and attempt + 1 < max_retries:
-                    print(f"    ⚠ Target closed during fetch_api: {e} [{self.telemetry_snapshot()}]")
-                    await self.rebuild(reason=f"target closed during fetch_api {path}")
+                if self.is_recoverable_browser_error(e) and attempt + 1 < max_retries:
+                    print(f"    ⚠ Recoverable browser error during fetch_api: {e} [{self.telemetry_snapshot()}]")
+                    await self.rebuild(reason=f"recoverable browser error during fetch_api {path}")
                     continue
                 raise
+            last_result = result
+            print(f"    ↳ fetch_api result {path}: HTTP {result.get('status')} [{self.telemetry_snapshot()}]")
             if result.get("status") != 403:
+                self._consecutive_403 = 0
                 return result
-            # 403 — rotate proxy IP by creating a new browser context
-            wait = 2 ** attempt + random.uniform(0.5, 1.5)
-            print(f"    ⚠ 403 on {path} (attempt {attempt+1}/{max_retries}), rotating proxy IP in {wait:.1f}s...")
+            self._consecutive_403 += 1
+            phase = "high" if any(token in path for token in ("/graph", "/odds/", "/comments")) else ("mid" if any(token in path for token in ("/statistics", "/shotmap")) else "core")
+            base_wait = {"core": 4.0, "mid": 12.0, "high": 25.0}[phase]
+            wait = base_wait * (attempt + 1) + random.uniform(0.8, 2.2)
+            if self._consecutive_403 >= 5:
+                wait = max(wait, 45 + random.uniform(0, 8))
+            if self._consecutive_403 >= 10:
+                wait = max(wait, 120 + random.uniform(0, 15))
+            print(f"    ⚠ 403 on {path} (attempt {attempt+1}/{max_retries}), cooling down {wait:.1f}s on sticky session...")
             await asyncio.sleep(wait)
-            try:
-                await self.rotate_context()
-            except Exception as e:
-                print(f"    ⚠ Context rotation failed: {e}")
-        return result  # return last result (403) after all retries exhausted
+        return last_result
 
     async def sleep_between(self, min_s: float = 1.5, max_s: float = 3.0):
         """Random sleep between requests."""
         await asyncio.sleep(random.uniform(min_s, max_s))
 
 
+class SmokeStatusReporter:
+    def __init__(self, path: Path):
+        self.path = path
+        self.state = {
+            "updated_at": _utc_now_iso(),
+            "phase": "init",
+            "competition": None,
+            "season_id": None,
+            "season_label": None,
+            "event_id": None,
+            "event_attempt": None,
+            "action": None,
+            "api_path": None,
+            "http_status": None,
+            "message": None,
+            "requests": 0,
+            "heals": 0,
+            "done_count": 0,
+            "failed_count": 0,
+        }
+        self.flush()
+
+    def update(self, **kwargs):
+        self.state.update(kwargs)
+        self.state["updated_at"] = _utc_now_iso()
+        self.flush()
+
+    def flush(self):
+        self.path.write_text(json.dumps(self.state, indent=2, ensure_ascii=False) + "\n")
+
+async def _fetch_endpoint_result(client: BackfillClient, endpoint_name: str, eid: int, *, prefer_capture: bool = False):
+    path = ENDPOINT_PATHS[endpoint_name].format(event_id=eid)
+    return await client.fetch_api(path, prefer_capture=prefer_capture)
+
+
+async def _process_non_event_endpoint(inserter, endpoint_name: str, eid: int, event_data: dict, result: dict) -> int:
+    if result.get("status") != 200:
+        return 0
+    body = result.get("body", {})
+    if endpoint_name in {"incidents", "lineups", "shotmap"} and isinstance(body, dict) and event_data:
+        body.setdefault("homeTeam", event_data.get("homeTeam", {}))
+        body.setdefault("awayTeam", event_data.get("awayTeam", {}))
+    if endpoint_name == "incidents":
+        return inserter.insert_incidents(eid, body)
+    if endpoint_name == "lineups":
+        return inserter.insert_lineups(eid, body)
+    if endpoint_name == "statistics":
+        return inserter.insert_statistics(eid, body)
+    if endpoint_name == "shotmap":
+        return inserter.insert_shotmap(eid, body)
+    if endpoint_name == "graph":
+        return inserter.insert_graph_points(eid, body)
+    if endpoint_name == "odds":
+        return inserter.insert_odds(eid, body)
+    if endpoint_name == "comments":
+        return inserter.insert_comments(eid, body)
+    return 0
+
+
+async def _run_endpoint_phase(client: BackfillClient, inserter, season_stats: dict, eid: int, event_data: dict,
+                              endpoint_names: Sequence[str], *, prefer_capture: bool = False,
+                              reporter: Optional[SmokeStatusReporter] = None):
+    for endpoint_name in endpoint_names:
+        phase = ENDPOINT_PHASE[endpoint_name]
+        sleep_min, sleep_max = PHASE_SLEEP_RANGES[phase]
+        print(f"    ↳ endpoint {endpoint_name} phase={phase} pre-sleep {sleep_min}-{sleep_max}s [event={eid}]")
+        if reporter:
+            reporter.update(phase="endpoint_pre_sleep", event_id=eid, action=f"endpoint:{endpoint_name}", api_path=ENDPOINT_PATHS[endpoint_name].format(event_id=eid), message=f"pre-sleep before {endpoint_name}", requests=client._request_count, heals=client._heal_count)
+        await client.sleep_between(sleep_min, sleep_max)
+        result = await _fetch_endpoint_result(client, endpoint_name, eid, prefer_capture=prefer_capture)
+        count = await _process_non_event_endpoint(inserter, endpoint_name, eid, event_data, result)
+        print(f"    ↳ endpoint {endpoint_name} done http={result.get('status')} rows={count} [event={eid}]")
+        if reporter:
+            reporter.update(phase="endpoint_done", event_id=eid, action=f"endpoint:{endpoint_name}", api_path=ENDPOINT_PATHS[endpoint_name].format(event_id=eid), http_status=result.get('status'), message=f"{endpoint_name} rows={count}", requests=client._request_count, heals=client._heal_count)
+        table_name = ENDPOINT_FETCH_LOG_TABLE[endpoint_name]
+        inserter.log_fetch(
+            table_name,
+            eid,
+            "success" if result.get("status") == 200 else "error",
+            count,
+            None if result.get("status") == 200 else f"HTTP {result.get('status')}",
+        )
+        season_stats[ENDPOINT_COUNTER_KEY[endpoint_name]] += count
+
+
 async def _process_event_with_retries(client: BackfillClient, inserter, progress, season_stats: dict,
                                       eid: int, sid: int, competition_id: int,
-                                      *, max_attempts: int = 2) -> bool:
+                                      *, max_attempts: int = 2,
+                                      reporter: Optional[SmokeStatusReporter] = None) -> bool:
     last_error = None
     for attempt in range(1, max_attempts + 1):
         client.set_event_context(eid, attempt)
         try:
+            print(f"    ↳ process_event {eid} attempt {attempt}/{max_attempts} start [{client.telemetry_snapshot()}]")
+            if reporter:
+                reporter.update(phase="process_event", event_id=eid, event_attempt=attempt, action="process_event", message=f"start event {eid} attempt {attempt}", requests=client._request_count, heals=client._heal_count)
             if attempt > 1:
                 print(f"    ↻ Retrying event {eid} (attempt {attempt}/{max_attempts})")
 
+            if reporter:
+                reporter.update(phase="warm_event", event_id=eid, event_attempt=attempt, action="warm_event", message=f"warming event {eid}", requests=client._request_count, heals=client._heal_count)
             await client.warm_event(eid)
-            await client.sleep_between(0.5, 1.0)
+            await client.sleep_between(*PHASE_SLEEP_RANGES["core"])
 
-            event_result = await client.fetch_api(f"/api/v1/event/{eid}")
+            if reporter:
+                reporter.update(phase="fetch_event", event_id=eid, event_attempt=attempt, action="fetch_event", api_path=ENDPOINT_PATHS['event'].format(event_id=eid), message="fetching core event payload", requests=client._request_count, heals=client._heal_count)
+            event_result = await _fetch_endpoint_result(client, "event", eid, prefer_capture=True)
+            print(f"    ↳ event core payload http={event_result.get('status')} [event={eid}]")
+            if reporter:
+                reporter.update(phase="fetch_event_done", event_id=eid, event_attempt=attempt, action="fetch_event", api_path=ENDPOINT_PATHS['event'].format(event_id=eid), http_status=event_result.get('status'), message="core event payload finished", requests=client._request_count, heals=client._heal_count)
             if event_result.get("status") != 200:
                 print(f"    ⚠ Event {eid}: HTTP {event_result.get('status')}")
                 progress.mark_failed(eid, f"event HTTP {event_result.get('status')}")
@@ -658,90 +1006,21 @@ async def _process_event_with_retries(client: BackfillClient, inserter, progress
             if event_data:
                 inserter.insert_match(event_data, sid, competition_id)
 
-            await client.sleep_between()
-            inc_result = await client.fetch_api(f"/api/v1/event/{eid}/incidents")
-            inc_count = 0
-            if inc_result.get("status") == 200:
-                inc_body = inc_result.get("body", {})
-                if event_data:
-                    inc_body.setdefault("homeTeam", event_data.get("homeTeam", {}))
-                    inc_body.setdefault("awayTeam", event_data.get("awayTeam", {}))
-                inc_count = inserter.insert_incidents(eid, inc_body)
-            inserter.log_fetch("match_incidents", eid, "success" if inc_result.get("status") == 200 else "error",
-                               inc_count, None if inc_result.get("status") == 200 else f"HTTP {inc_result.get('status')}")
-
-            await client.sleep_between()
-            lineup_result = await client.fetch_api(f"/api/v1/event/{eid}/lineups")
-            lineup_count = 0
-            if lineup_result.get("status") == 200:
-                lineup_body = lineup_result.get("body", {})
-                if event_data:
-                    lineup_body.setdefault("homeTeam", event_data.get("homeTeam", {}))
-                    lineup_body.setdefault("awayTeam", event_data.get("awayTeam", {}))
-                lineup_count = inserter.insert_lineups(eid, lineup_body)
-            inserter.log_fetch("match_lineups", eid, "success" if lineup_result.get("status") == 200 else "error",
-                               lineup_count, None if lineup_result.get("status") == 200 else f"HTTP {lineup_result.get('status')}")
-
-            await client.sleep_between()
-            stats_result = await client.fetch_api(f"/api/v1/event/{eid}/statistics")
-            stats_count = 0
-            if stats_result.get("status") == 200:
-                stats_count = inserter.insert_statistics(eid, stats_result.get("body", {}))
-            inserter.log_fetch("match_statistics", eid, "success" if stats_result.get("status") == 200 else "error",
-                               stats_count, None if stats_result.get("status") == 200 else f"HTTP {stats_result.get('status')}")
-
-            await client.sleep_between()
-            shot_result = await client.fetch_api(f"/api/v1/event/{eid}/shotmap")
-            shot_count = 0
-            if shot_result.get("status") == 200:
-                shot_body = shot_result.get("body", {})
-                if event_data:
-                    shot_body.setdefault("homeTeam", event_data.get("homeTeam", {}))
-                    shot_body.setdefault("awayTeam", event_data.get("awayTeam", {}))
-                shot_count = inserter.insert_shotmap(eid, shot_body)
-            inserter.log_fetch("match_shotmap", eid, "success" if shot_result.get("status") == 200 else "error",
-                               shot_count, None if shot_result.get("status") == 200 else f"HTTP {shot_result.get('status')}")
-
-            await client.sleep_between()
-            graph_result = await client.fetch_api(f"/api/v1/event/{eid}/graph")
-            graph_count = 0
-            if graph_result.get("status") == 200:
-                graph_count = inserter.insert_graph_points(eid, graph_result.get("body", {}))
-            inserter.log_fetch("match_graph_points", eid, "success" if graph_result.get("status") == 200 else "error",
-                               graph_count, None if graph_result.get("status") == 200 else f"HTTP {graph_result.get('status')}")
-
-            await client.sleep_between()
-            odds_result = await client.fetch_api(f"/api/v1/event/{eid}/odds/1/all")
-            odds_count = 0
-            if odds_result.get("status") == 200:
-                odds_count = inserter.insert_odds(eid, odds_result.get("body", {}))
-            inserter.log_fetch("match_odds", eid, "success" if odds_result.get("status") == 200 else "error",
-                               odds_count, None if odds_result.get("status") == 200 else f"HTTP {odds_result.get('status')}")
-
-            await client.sleep_between()
-            comments_result = await client.fetch_api(f"/api/v1/event/{eid}/comments")
-            comments_count = 0
-            if comments_result.get("status") == 200:
-                comments_count = inserter.insert_comments(eid, comments_result.get("body", {}))
-            inserter.log_fetch("match_comments", eid, "success" if comments_result.get("status") == 200 else "error",
-                               comments_count, None if comments_result.get("status") == 200 else f"HTTP {comments_result.get('status')}")
+            await _run_endpoint_phase(client, inserter, season_stats, eid, event_data, CORE_ENDPOINTS[1:], prefer_capture=True, reporter=reporter)
+            await _run_endpoint_phase(client, inserter, season_stats, eid, event_data, MID_RISK_ENDPOINTS, prefer_capture=True, reporter=reporter)
+            await _run_endpoint_phase(client, inserter, season_stats, eid, event_data, HIGH_RISK_ENDPOINTS, prefer_capture=False, reporter=reporter)
 
             progress.mark_done(eid)
             season_stats["processed"] += 1
-            season_stats["incidents"] += inc_count
-            season_stats["lineups"] += lineup_count
-            season_stats["statistics"] += stats_count
-            season_stats["shotmap"] += shot_count
-            season_stats["graph"] += graph_count
-            season_stats["odds"] += odds_count
-            season_stats["comments"] += comments_count
+            if reporter:
+                reporter.update(phase="done", event_id=eid, event_attempt=attempt, action="done", message=f"event {eid} processed", requests=client._request_count, heals=client._heal_count, done_count=progress.done_count, failed_count=len(progress._state.get('events_failed', [])))
             client.clear_event_context()
             return True
         except PlaywrightError as e:
             last_error = e
-            if client.is_target_closed_error(e) and attempt < max_attempts:
-                print(f"    ⚠ Target closed while processing event {eid}: {e} [{client.telemetry_snapshot()}]")
-                await client.rebuild(reason=f"target closed while processing event {eid}")
+            if client.is_recoverable_browser_error(e) and attempt < max_attempts:
+                print(f"    ⚠ Recoverable browser error while processing event {eid}: {e} [{client.telemetry_snapshot()}]")
+                await client.rebuild(reason=f"recoverable browser error while processing event {eid}")
                 continue
             break
         except Exception as e:
@@ -751,6 +1030,8 @@ async def _process_event_with_retries(client: BackfillClient, inserter, progress
     print(f"    ❌ Event {eid} error: {last_error} [{client.telemetry_snapshot()}]")
     progress.mark_failed(eid, str(last_error))
     season_stats["failed"] += 1
+    if reporter:
+        reporter.update(phase="failed", event_id=eid, action="failed", message=str(last_error), requests=client._request_count, heals=client._heal_count, done_count=progress.done_count, failed_count=len(progress._state.get('events_failed', [])))
     client.clear_event_context()
     return False
 
@@ -875,7 +1156,7 @@ class DataInserter:
         away_team = event.get("awayTeam", {})
         home_score = event.get("homeScore", {}).get("current")
         away_score = event.get("awayScore", {}).get("current")
-        status = event.get("status", {}).get("type", "scheduled")
+        status = _normalize_match_status(event.get("status", {}).get("type", "scheduled"))
         round_info = event.get("roundInfo", {}).get("round")
         start_ts = event.get("startTimestamp")
 
@@ -1390,6 +1671,8 @@ async def backfill_competition(
     limit_rounds: int = 0,
     limit_events: int = 0,
     dry_run: bool = False,
+    headless: bool = True,
+    sticky_session_key: Optional[str] = None,
 ) -> dict:
     """Backfill one competition."""
     import re
@@ -1423,14 +1706,20 @@ async def backfill_competition(
     print(f"{'='*60}")
 
     results = {"competition": name, "seasons": {}}
+    status_path = STATUS_DIR / f"smoke_status_{name.replace(' ','_')}.json"
+    reporter = SmokeStatusReporter(status_path)
+    reporter.update(phase="start", competition=name, message="starting backfill competition")
 
-    async with BackfillClient(headless=True) as client:
+    async with BackfillClient(headless=headless, sticky_session_key=sticky_session_key) as client:
         # Warm homepage
+        reporter.update(phase="warm_homepage", action="warm_homepage", message="warming homepage", requests=client._request_count, heals=client._heal_count)
         await client.warm_homepage()
+        reporter.update(phase="warm_homepage_done", action="warm_homepage", message="homepage warmed", requests=client._request_count, heals=client._heal_count)
         print(f"✅ Session warmed")
 
         for sid, label in sorted(target_seasons.items()):
             print(f"\n📅 Season {label} (SID={sid})")
+            reporter.update(phase="season_start", season_id=sid, season_label=label, action="season_start", message=f"season {label} start")
 
             if dry_run:
                 print(f"  [DRY] Would process season {label}")
@@ -1439,7 +1728,9 @@ async def backfill_competition(
 
             # Ensure season in DB
             season_payload = None
+            reporter.update(phase="season_meta", season_id=sid, season_label=label, api_path=f"/api/v1/unique-tournament/{ut_id}/season/{sid}", action="season_meta", message="fetching season metadata", requests=client._request_count, heals=client._heal_count)
             season_result = await client.fetch_api(f"/api/v1/unique-tournament/{ut_id}/season/{sid}")
+            reporter.update(phase="season_meta_done", season_id=sid, season_label=label, api_path=f"/api/v1/unique-tournament/{ut_id}/season/{sid}", action="season_meta", http_status=season_result.get('status'), message="season metadata fetched", requests=client._request_count, heals=client._heal_count)
             if season_result.get("status") == 200:
                 season_body = season_result.get("body", {})
                 season_payload = season_body.get("season") if isinstance(season_body, dict) else None
@@ -1451,14 +1742,18 @@ async def backfill_competition(
 
             # Warm tournament page
             try:
+                reporter.update(phase="warm_tournament", season_id=sid, season_label=label, action="warm_tournament", message=f"warming tournament {ut_id}/{sid}", requests=client._request_count, heals=client._heal_count)
                 await client.warm_tournament(ut_id, sid)
+                reporter.update(phase="warm_tournament_done", season_id=sid, season_label=label, action="warm_tournament", message=f"tournament {ut_id}/{sid} warmed", requests=client._request_count, heals=client._heal_count)
             except Exception as e:
                 print(f"  ❌ Failed to warm tournament page: {e}")
                 results["seasons"][sid] = {"status": "error", "reason": str(e)}
                 continue
 
             # Get rounds
+            reporter.update(phase="rounds", season_id=sid, season_label=label, api_path=f"/api/v1/unique-tournament/{ut_id}/season/{sid}/rounds", action="rounds", message="fetching rounds", requests=client._request_count, heals=client._heal_count)
             rounds_result = await client.fetch_api(f"/api/v1/unique-tournament/{ut_id}/season/{sid}/rounds")
+            reporter.update(phase="rounds_done", season_id=sid, season_label=label, api_path=f"/api/v1/unique-tournament/{ut_id}/season/{sid}/rounds", action="rounds", http_status=rounds_result.get('status'), message="rounds fetched", requests=client._request_count, heals=client._heal_count)
             if rounds_result.get("status") != 200:
                 print(f"  ❌ Failed to get rounds: HTTP {rounds_result.get('status')}")
                 results["seasons"][sid] = {"status": "error", "reason": f"rounds HTTP {rounds_result.get('status')}"}
@@ -1477,6 +1772,7 @@ async def backfill_competition(
             )
 
             print(f"  {len(all_event_ids)} events to process via {discovery_method} (already done: {progress.done_count})")
+            reporter.update(phase="event_discovery_done", season_id=sid, season_label=label, action="event_discovery", message=f"{len(all_event_ids)} events via {discovery_method}", done_count=progress.done_count, failed_count=len(progress._state.get('events_failed', [])), requests=client._request_count, heals=client._heal_count)
 
             if limit_events > 0:
                 all_event_ids = all_event_ids[:limit_events]
@@ -1498,6 +1794,7 @@ async def backfill_competition(
                     eid,
                     sid,
                     competition_id,
+                    reporter=reporter,
                 )
 
                 if ok and ((i + 1) % 10 == 0 or (i + 1) == len(all_event_ids)):
@@ -1508,8 +1805,10 @@ async def backfill_competition(
                     )
 
             print(f"  ✅ Season {label}: {season_stats['processed']} processed, {season_stats['skipped']} skipped, {season_stats['failed']} failed")
+            reporter.update(phase="season_done", season_id=sid, season_label=label, action="season_done", message=f"processed={season_stats['processed']} skipped={season_stats['skipped']} failed={season_stats['failed']}", done_count=progress.done_count, failed_count=len(progress._state.get('events_failed', [])), requests=client._request_count, heals=client._heal_count)
             results["seasons"][sid] = season_stats
 
+    reporter.update(phase="complete", action="complete", message="competition finished")
     mysql_conn.close()
     return results
 
@@ -1599,6 +1898,8 @@ async def main():
     ap.add_argument("--limit-rounds", type=int, default=0, help="Limit rounds per season (0=all)")
     ap.add_argument("--limit-events", type=int, default=0, help="Limit events (0=all)")
     ap.add_argument("--dry-run", action="store_true", help="Show what would run")
+    ap.add_argument("--headful", action="store_true", help="Run browser with visible UI for testing")
+    ap.add_argument("--sticky-session-key", type=str, help="Override sticky proxy session key")
     ap.add_argument("--test-match-json", type=str, help="Run parser against a captured full-match JSON bundle")
     args = ap.parse_args()
 
@@ -1615,6 +1916,7 @@ async def main():
             print(f"Available: {', '.join(sorted(competitions.keys()))}")
             return
         comp = competitions[args.competition]
+        session_key = args.sticky_session_key or f"{PROXY_SESSION_PREFIX}-{args.competition.lower().replace(' ', '-') }"
         result = await backfill_competition(
             name=args.competition,
             ut_id=comp["ut_id"],
@@ -1626,6 +1928,8 @@ async def main():
             limit_rounds=args.limit_rounds,
             limit_events=args.limit_events,
             dry_run=args.dry_run,
+            headless=not args.headful,
+            sticky_session_key=session_key,
         )
         print(f"\n{json.dumps(result, indent=2, ensure_ascii=False)}")
 
@@ -1636,6 +1940,7 @@ async def main():
                 print(f"\n⏭ [{i}/{total}] {name}: no seasons discovered, skipping")
                 continue
             print(f"\n[{i}/{total}] {name}")
+            session_key = args.sticky_session_key or f"{PROXY_SESSION_PREFIX}-{name.lower().replace(' ', '-') }"
             result = await backfill_competition(
                 name=name,
                 ut_id=comp["ut_id"],
@@ -1646,6 +1951,8 @@ async def main():
                 limit_rounds=args.limit_rounds,
                 limit_events=args.limit_events,
                 dry_run=args.dry_run,
+                headless=not args.headful,
+                sticky_session_key=session_key,
             )
             # Small delay between competitions
             await asyncio.sleep(5)

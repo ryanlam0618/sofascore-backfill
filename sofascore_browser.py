@@ -19,6 +19,7 @@ import json
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional
+import random
 
 from playwright.async_api import async_playwright
 
@@ -26,6 +27,7 @@ BROWSER_BASE = "https://www.sofascore.com"
 API_BASE = "https://www.sofascore.com/api/v1"
 PROXY_SERVER = os.getenv("SOFA_PROXY", "http://p.webshare.io:80")
 PROXY_USERNAME = os.getenv("SOFA_PROXY_USERNAME", "aeptenjc-rotate")
+PROXY_SESSION_KEY = os.getenv("SOFA_PROXY_SESSION_KEY", "")
 PROXY_PASSWORD = os.getenv("SOFA_PROXY_PASSWORD", "")
 DEFAULT_USER_AGENT = os.getenv(
     "SOFA_USER_AGENT",
@@ -175,8 +177,9 @@ MISC_ENDPOINTS: tuple[EndpointSpec, ...] = (
 class SofaScoreBrowserClient:
     """Browser-first SofaScore client."""
 
-    def __init__(self, headless: bool = True):
+    def __init__(self, headless: bool = True, sticky_session_key: Optional[str] = None):
         self.headless = headless
+        self.sticky_session_key = sticky_session_key or PROXY_SESSION_KEY or None
         self._pw = None
         self.browser = None
         self.context = None
@@ -184,22 +187,28 @@ class SofaScoreBrowserClient:
 
     async def __aenter__(self):
         self._pw = await async_playwright().start()
+        launch_args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--window-size=1920,1080",
+            "--disable-blink-features=AutomationControlled",
+        ]
+        if self.headless:
+            launch_args.append("--headless=new")
         self.browser = await self._pw.chromium.launch(
             headless=self.headless,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--window-size=1920,1080",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=launch_args,
         )
+        proxy_username = PROXY_USERNAME
+        if self.sticky_session_key:
+            proxy_username = f"{proxy_username}-session-{self.sticky_session_key}"
         self.context = await self.browser.new_context(
             viewport={"width": 1920, "height": 1080},
             user_agent=DEFAULT_USER_AGENT,
             proxy={
                 "server": PROXY_SERVER,
-                "username": PROXY_USERNAME,
+                "username": proxy_username,
                 "password": PROXY_PASSWORD,
             } if PROXY_SERVER else None,
             extra_http_headers={"Accept-Language": DEFAULT_ACCEPT_LANGUAGE},
@@ -217,32 +226,50 @@ class SofaScoreBrowserClient:
         if self._pw:
             await self._pw.stop()
 
+    async def _humanize_page(self) -> None:
+        try:
+            await self.page.mouse.move(random.randint(140, 640), random.randint(110, 420), steps=random.randint(8, 18))
+            await asyncio.sleep(random.uniform(0.2, 0.6))
+            await self.page.mouse.wheel(0, random.randint(180, 520))
+            await asyncio.sleep(random.uniform(0.4, 1.0))
+        except Exception:
+            return
+
     async def warm_event_page(self, event_id: int, timeout: int = 60) -> None:
         await self.page.goto(
             f"{BROWSER_BASE}/event/{event_id}",
             timeout=timeout * 1000,
-            wait_until="networkidle",
+            wait_until="domcontentloaded",
         )
+        # Give JS a moment to initialize session/cookies
+        await asyncio.sleep(2)
+        await self._humanize_page()
 
     async def warm_tournament_page(self, tournament_id: int, season_id: Optional[int] = None, timeout: int = 60) -> None:
         url = f"{BROWSER_BASE}/football/unique-tournament/{tournament_id}"
         if season_id is not None:
             url = f"{url}/season/{season_id}"
-        await self.page.goto(url, timeout=timeout * 1000, wait_until="networkidle")
+        await self.page.goto(url, timeout=timeout * 1000, wait_until="domcontentloaded")
+        await asyncio.sleep(2)
+        await self._humanize_page()
 
     async def warm_team_page(self, team_id: int, timeout: int = 60) -> None:
         await self.page.goto(
             f"{BROWSER_BASE}/team/football/{team_id}",
             timeout=timeout * 1000,
-            wait_until="networkidle",
+            wait_until="domcontentloaded",
         )
+        await asyncio.sleep(2)
+        await self._humanize_page()
 
     async def warm_sport_page(self, sport: str = "football", timeout: int = 60) -> None:
         await self.page.goto(
             f"{BROWSER_BASE}/{sport}",
             timeout=timeout * 1000,
-            wait_until="networkidle",
+            wait_until="domcontentloaded",
         )
+        await asyncio.sleep(2)
+        await self._humanize_page()
 
     async def get_ssr(self) -> Optional[dict]:
         return await self.page.evaluate(

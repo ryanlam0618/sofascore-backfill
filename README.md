@@ -15,10 +15,10 @@ This repo is organized around one practical goal: reliably enumerate competition
 
 ## Current architecture
 
-There are effectively **two backfill paths** in the repo:
+The supported production path is intentionally small:
 
-### 1) `backfill_runner.py` — the newer end-to-end pipeline
-This is the clearest current implementation of the browser-first → normalized storage flow.
+### `backfill_runner.py` — the production backfill entry point
+This is the browser-first -> normalized MySQL pipeline. The old modular fetch/orchestrator scripts are retained in Git history, but are not part of the supported v2 runtime.
 
 Flow:
 1. warm homepage / tournament / event in Playwright
@@ -32,24 +32,15 @@ Best for:
 - direct MySQL ingestion
 - seeing the normalized data model in action
 
-### 2) `orchestrator.py` + `fetch_*.py` — the operational batch toolkit
-This is the broader script runner for large backfills and recovery runs.
+The supported flow is:
+1. discover or verify season IDs
+2. load the competition and season configuration
+3. warm a browser session and enumerate rounds/events
+4. fetch event bundles with retry and self-healing browser recovery
+5. normalize and write records to MySQL
+6. persist per-season progress so failed events can be resumed
 
-Flow:
-1. discover season IDs
-2. run fetch scripts by phase / dataset
-3. persist results in SQLite per dataset/script
-4. optionally migrate or sync results into MySQL
-
-Best for:
-- modular extraction by data type
-- running one data family at a time
-- experimentation and recovery when one script fails
-- operational monitoring with state/log files and watcher helpers
-
-Important caveat:
-- `orchestrator.py` is currently more **operationally complete** than `main.py` for running the script-based toolkit end to end.
-- `main.py` exposes a polished unified CLI, but its phase 2/3 backfill path is still marked not implemented in this version.
+The deleted legacy scripts are intentionally not documented as runnable entry points.
 
 ## Repo map
 
@@ -107,6 +98,8 @@ The repo is configured around a 10-year backfill window for a curated set of foo
 
 Competition metadata lives in `competitions_10y.yaml`. Discovered season IDs live in `discoveries.json`.
 
+Configuration status is not the same as live URL validation: the YAML currently defines 24 target competitions, while the checked-in discovery snapshot currently contains 23 competitions. The discovery snapshot records only one event endpoint check (`Premier League`, season `76986`); it is not evidence that every 10-year season URL returns HTTP 200.
+
 ## Data model at a glance
 
 The normalized MySQL schema (`mysql_schema_v2.sql`) centers on:
@@ -118,6 +111,18 @@ The normalized MySQL schema (`mysql_schema_v2.sql`) centers on:
 - operational logging: `fetch_log`
 
 This makes the repo useful both for raw collection and for analytics-friendly downstream storage.
+
+## Validation status
+
+The repository has proven the core pipeline on real SofaScore requests and partial backfill runs. It has not yet completed a 24-competition x 10-year URL audit. Before a full run, validate each target season with the browser path and record HTTP status, redirect/failure reason, and the timestamp of the check. Treat `discoveries.json` as a progress snapshot, not as a completed audit.
+
+Recommended gates:
+
+```bash
+python3 -m py_compile backfill_runner.py discover_seasons.py
+python3 backfill_runner.py --competition "Premier League" --season-id 76986 --limit-rounds 1 --limit-events 1 --dry-run
+python3 backfill_runner.py --competition "Premier League" --season-id 76986 --limit-rounds 1 --limit-events 1
+```
 
 ## Browser-first strategy
 
@@ -189,7 +194,7 @@ If you are setting this repo up today, prefer matching `.env.example` first, the
 4. Verify MySQL connectivity if you plan to write to `appdb`
 5. Run season discovery before large backfills
 
-Because dependency management is not fully standardized in the repo, check imports in the scripts you plan to run. The main runtime dependencies are Playwright, `python-dotenv`, and `mysql-connector-python` for MySQL-writing flows.
+Runtime dependencies for the supported runner are listed in `requirements.txt`: Playwright, `python-dotenv`, PyYAML, and `mysql-connector-python`.
 
 ## Typical workflows
 
@@ -256,11 +261,13 @@ python3 orchestrator.py --status
 
 ## Output locations
 
-Common output paths:
+Common local output paths:
 
-- `discoveries.json` — discovered seasons and metadata
-- `data/backfill_sofascore_10y/` — SQLite files, progress files, orchestrator state
-- `data/logs/` — per-script / per-competition logs
+- `discoveries.json` — checked-in discovery snapshot
+- `data/backfill_sofascore_10y/` — local progress files and runtime state
+- `logs/` — local backfill logs
+
+Runtime outputs are intentionally ignored by Git. Do not commit credentials, proxy lists, logs, captured payloads, local databases, or virtual environments.
 
 Typical generated files include:
 - `*_state.json`
@@ -278,29 +285,23 @@ Typical generated files include:
 
 ## Current rough edges / things to know before editing
 
-This repo is useful, but it is **not yet fully unified**. A few mismatches show up when reading the code:
-
-- there are two orchestration approaches (`backfill_runner.py` and `orchestrator.py`)
-- `orchestrator.py` still advertises deleted legacy files like `fetch_lineups.py` and `fetch_statistics.py` in its header docstring
-- `main.py` presents a polished unified CLI, but parts of phase 2/3 are still marked not implemented there
-- proxy environment variable naming is inconsistent across files
-- some operational helpers look older than the newer normalized/MySQL-first path
-- several diagnostic/test scripts live beside production scripts, so the repo map is broader than the main runtime path
-
-So the repo should be read as **working infrastructure plus active refactor/migration**, not as a fully finished product.
+- The supported runner is operational, but full 24-competition / 10-year coverage has not been live-validated.
+- SofaScore 403s and connection failures remain possible; retry and browser recovery reduce but do not eliminate them.
+- `discoveries.json` and runtime progress files are snapshots and can become stale.
+- Keep credentials, proxies, logs, captured payloads, SQLite files, and virtual environments local; they are ignored by Git.
+- The repository is an active backfill project, not a claim of completed full coverage.
 
 ## Recommended starting points for a new contributor
 
-If you want to understand the code quickly, read in this order:
+Read in this order:
 
 1. `README.md`
-2. `main.py`
-3. `backfill_runner.py`
-4. `sofascore_browser.py`
-5. `discover_seasons.py`
-6. `mysql_schema_v2.sql`
-7. `orchestrator.py`
-8. one or two `fetch_*.py` scripts relevant to the data you care about
+2. `backfill_runner.py`
+3. `competitions_10y.yaml`
+4. `discoveries.json`
+5. `mysql_schema_v2.sql`
+6. `sofascore_browser.py`
+7. `discover_seasons.py`
 
 If you want to run something safely, start with:
 
@@ -308,16 +309,12 @@ If you want to run something safely, start with:
 2. `backfill_runner.py --competition "Premier League" --limit-rounds 1 --limit-events 5`
 3. inspect generated progress / logs / MySQL writes
 
-## Recommended cleanup directions
+## Recommended next work
 
-If this repo is being actively developed, the most valuable follow-up improvements would be:
-
-1. unify on one primary orchestration path
-2. standardize proxy env names
-3. document Python dependencies explicitly in a requirements file or pyproject
-4. align `main.py`, `orchestrator.py`, and the fetch scripts so the wrapper matches reality
-5. decide whether SQLite is only a staging layer or still a first-class storage target
-6. clean up outdated docstrings/comments and separate diagnostic scripts from main runtime paths where helpful
+1. Add a dedicated browser URL audit that covers every configured competition and season and writes a timestamped, reproducible report.
+2. Reconcile the 24-entry YAML target with the 23-entry discovery snapshot, including AFC Champions League Two.
+3. Retry and classify failed events after the URL audit, separating anti-bot failures from parser/database failures.
+4. Keep the production runner and diagnostics separate from historical legacy code.
 
 ## Quick verdict
 

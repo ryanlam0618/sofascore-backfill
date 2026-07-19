@@ -1,21 +1,37 @@
-# Runtime data
+# Runtime data and local outputs
 /data/
+logs/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
 *_state.json
+*_state.json.bak_*
+progress_*.json
+progress_*.json.bak_*
+*_full.json
+*_raw.json
+*.log
 
-# Python
+# Local scratch / recovery copies
+_archived/
+*.bak
+*.bak4retry
+.learnings/
+
+# Python environments and caches
+.venv/
+.runner-venv/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .pytest_cache/
 
-# Local env
+# Local env and credentials
 .env
 .env.*
 !.env.example
+proxy_list.txt
 
 # OS/editor
 .DS_Store

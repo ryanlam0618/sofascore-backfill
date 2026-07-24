@@ -20,6 +20,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional
 import random
+from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
 
@@ -37,6 +38,17 @@ DEFAULT_USER_AGENT = os.getenv(
     ),
 )
 DEFAULT_ACCEPT_LANGUAGE = os.getenv("SOFA_ACCEPT_LANGUAGE", "en-US,en;q=0.9")
+
+BLOCKED_THIRD_PARTY_DOMAINS = (
+    "smartadserver.com",
+    "googleadservices.com",
+    "googlesyndication.com",
+    "doubleclick.net",
+    "googletagmanager.com",
+    "google-analytics.com",
+)
+
+BLOCKED_RESOURCE_TYPES = {"image", "stylesheet", "font", "media"}
 
 
 @dataclass(frozen=True)
@@ -214,6 +226,7 @@ class SofaScoreBrowserClient:
             extra_http_headers={"Accept-Language": DEFAULT_ACCEPT_LANGUAGE},
         )
         self.page = await self.context.new_page()
+        await self._block_unneeded_resources(self.page)
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -234,6 +247,21 @@ class SofaScoreBrowserClient:
             await asyncio.sleep(random.uniform(0.4, 1.0))
         except Exception:
             return
+
+    async def _block_unneeded_resources(self, page) -> None:
+        async def handle_route(route):
+            request = route.request
+            host = (urlparse(request.url).hostname or "").lower()
+            should_block_host = any(
+                host == domain or host.endswith(f".{domain}")
+                for domain in BLOCKED_THIRD_PARTY_DOMAINS
+            )
+            if request.resource_type in BLOCKED_RESOURCE_TYPES or should_block_host:
+                await route.abort()
+                return
+            await route.continue_()
+
+        await page.route("**/*", handle_route)
 
     async def warm_event_page(self, event_id: int, timeout: int = 60) -> None:
         await self.page.goto(

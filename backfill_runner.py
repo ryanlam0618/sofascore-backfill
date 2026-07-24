@@ -33,6 +33,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
+from urllib.parse import urlparse
 
 
 def _utc_now_iso() -> str:
@@ -166,6 +167,30 @@ from dotenv import load_dotenv
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
 
+from anti_block import PLATFORM_MAP, USER_AGENTS, get_platform, get_sec_ch_ua
+
+try:
+    from playwright_stealth import stealth_async
+    _STEALTH = None
+    HAS_STEALTH = True
+except ImportError:
+    try:
+        from playwright_stealth import Stealth
+        stealth_async = None
+        _STEALTH = Stealth()
+        HAS_STEALTH = True
+    except ImportError:
+        stealth_async = None
+        _STEALTH = None
+        HAS_STEALTH = False
+
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    curl_requests = None
+    HAS_CURL_CFFI = False
+
 
 def ensure_country(mysql_conn, country_code: Optional[str], country_name: Optional[str] = None, alpha2: Optional[str] = None) -> Optional[str]:
     """Ensure a country reference exists before teams/players point at it."""
@@ -193,6 +218,7 @@ WORKDIR = Path(__file__).parent
 DISCOVERIES_FILE = WORKDIR / "discoveries.json"
 COMPETITIONS_FILE = WORKDIR / "competitions_10y.yaml"
 DATA_DIR = WORKDIR / "data" / "backfill_sofascore_10y"
+SEASON_URLS_FILE = WORKDIR / "data" / "season_urls_24_competitions.json"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATUS_DIR = WORKDIR / "logs"
 STATUS_DIR.mkdir(parents=True, exist_ok=True)
@@ -251,21 +277,28 @@ PROXY_PORT = os.getenv("SOFA_PROXY_PORT", "80")
 PROXY_USER = os.getenv("SOFA_PROXY_USER", "aeptenjc-rotate")
 PROXY_PASS = os.getenv("SOFA_PROXY_PASS", "")
 PROXY_SESSION_PREFIX = os.getenv("SOFA_PROXY_SESSION_PREFIX", "sofa")
-PROXY_STICKY_MINUTES = int(os.getenv("SOFA_PROXY_STICKY_MINUTES", "15"))
+PROXY_STICKY_MINUTES = int(os.getenv("SOFA_PROXY_STICKY_MINUTES", "0"))  # 0 = rotate per request
+BROWSER_RESTART_INTERVAL = 1800
 
 # Load .env
 load_dotenv(WORKDIR / ".env")
 if not PROXY_PASS:
     PROXY_PASS = os.getenv("SOFA_PROXY_PASS", "")
 
-DEFAULT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
-)
-
 CORE_ENDPOINTS: Sequence[str] = ("event", "incidents", "lineups")
 MID_RISK_ENDPOINTS: Sequence[str] = ("statistics", "shotmap")
 HIGH_RISK_ENDPOINTS: Sequence[str] = ("graph", "odds", "comments")
+
+BLOCKED_THIRD_PARTY_DOMAINS: Sequence[str] = (
+    "smartadserver.com",
+    "googleadservices.com",
+    "googlesyndication.com",
+    "doubleclick.net",
+    "googletagmanager.com",
+    "google-analytics.com",
+)
+
+BLOCKED_RESOURCE_TYPES = {"image", "stylesheet", "font", "media"}
 
 ENDPOINT_PATHS = {
     "event": "/api/v1/event/{event_id}",
@@ -279,9 +312,9 @@ ENDPOINT_PATHS = {
 }
 
 PHASE_SLEEP_RANGES = {
-    "core": (1.2, 2.4),
-    "mid": (3.0, 5.0),
-    "high": (5.5, 9.0),
+    "core": (5.0, 8.0),
+    "mid": (8.0, 12.0),
+    "high": (12.0, 18.0),
 }
 
 ENDPOINT_PHASE = {
@@ -526,6 +559,11 @@ class BackfillClient:
         self._response_cache = {}
         self._response_waiters = {}
         self._network_capture_enabled = True
+        self._current_ua = random.choice(USER_AGENTS)
+        self._current_headers = {}
+        self._current_proxy_url = None
+        self._current_tournament_url = f"{BROWSER_BASE}/"
+        self._last_browser_restart = time.time()
 
     async def __aenter__(self):
         self._pw = await async_playwright().start()
@@ -533,7 +571,18 @@ class BackfillClient:
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--disable-gpu",
-            "--window-size=1920,1080",
+            "--disable-setuid-sandbox",
+            "--disable-accelerated-2d-canvas",
+            "--disable-extensions",
+            "--disable-plugins",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--memory-pressure-off",
+            "--no-zygote",
+            "--no-first-run",
+            "--disable-webgl",
+            '--js-flags="--max-old-space-size=512"',
             "--disable-blink-features=AutomationControlled",
         ]
         if self.headless:
@@ -542,16 +591,8 @@ class BackfillClient:
             headless=self.headless,
             args=launch_args,
         )
-        proxy_config = self._build_proxy_config()
-        self.context = await self.browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent=DEFAULT_UA,
-            proxy=proxy_config,
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-        )
-        self.page = await self.context.new_page()
-        self.api_page = await self.context.new_page()
-        self._wire_network_capture()
+        self._last_browser_restart = time.time()
+        await self._create_context_pages()
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -559,13 +600,70 @@ class BackfillClient:
 
     def _build_proxy_config(self):
         if not PROXY_SERVER:
+            self._current_proxy_url = None
             return None
         username = PROXY_USER
+        password_part = f":{PROXY_PASS}" if PROXY_PASS else ""
+        self._current_proxy_url = f"http://{username}{password_part}@{PROXY_SERVER}:{PROXY_PORT}"
         return {
             "server": f"http://{PROXY_SERVER}:{PROXY_PORT}",
             "username": username,
             "password": PROXY_PASS,
         }
+
+    def _build_context_headers(self, ua: str) -> dict:
+        platform = get_platform(ua)
+        is_mobile = "Mobile" in ua or "Android" in ua or "iPhone" in ua
+        return {
+            "Accept-Language": "en-US,en;q=0.9",
+            "Sec-CH-UA": get_sec_ch_ua(ua),
+            "Sec-CH-UA-Mobile": "?1" if is_mobile else "?0",
+            "Sec-CH-UA-Platform": PLATFORM_MAP.get(platform, '"Windows"'),
+        }
+
+    async def _apply_stealth(self, page):
+        if not HAS_STEALTH or not page:
+            return
+        if stealth_async is not None:
+            await stealth_async(page)
+        elif _STEALTH is not None:
+            await _STEALTH.apply_stealth_async(page)
+
+    async def _new_stealth_page(self):
+        page = await self.context.new_page()
+        await self._apply_stealth(page)
+        await self._block_unneeded_resources(page)
+        return page
+
+    async def _block_unneeded_resources(self, page):
+        async def handle_route(route):
+            request = route.request
+            host = (urlparse(request.url).hostname or "").lower()
+            should_block_host = any(
+                host == domain or host.endswith(f".{domain}")
+                for domain in BLOCKED_THIRD_PARTY_DOMAINS
+            )
+            if request.resource_type in BLOCKED_RESOURCE_TYPES or should_block_host:
+                await route.abort()
+                return
+            await route.continue_()
+
+        await page.route("**/*", handle_route)
+
+    async def _create_context_pages(self):
+        proxy_config = self._build_proxy_config()
+        self._current_ua = random.choice(USER_AGENTS)
+        self._current_headers = self._build_context_headers(self._current_ua)
+        self._current_tournament_url = f"{BROWSER_BASE}/"
+        self.context = await self.browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=self._current_ua,
+            proxy=proxy_config,
+            extra_http_headers=self._current_headers,
+        )
+        self.page = await self._new_stealth_page()
+        self.api_page = await self._new_stealth_page()
+        self._wire_network_capture()
 
     def _wire_network_capture(self):
         self._response_cache = {}
@@ -691,11 +789,17 @@ class BackfillClient:
             or ("navigation" in lowered and "interrupted" in lowered)
         )
 
+    @staticmethod
+    def is_timeout_error(exc: Exception) -> bool:
+        """Check if error is a Playwright TimeoutError (e.g. Page.goto timeout)."""
+        return isinstance(exc, PlaywrightError) and "Timeout" in type(exc).__name__
+
     def is_recoverable_browser_error(self, exc: Exception) -> bool:
         return (
             self.is_target_closed_error(exc)
             or self.is_transport_closed_error(exc)
             or self.is_navigation_context_error(exc)
+            or self.is_timeout_error(exc)
         )
 
     def set_event_context(self, event_id: Optional[int], attempt: Optional[int], action: str = "event"):
@@ -729,6 +833,12 @@ class BackfillClient:
         if warm_homepage:
             await self.warm_homepage()
 
+    async def maybe_restart_browser(self):
+        if time.time() - self._last_browser_restart > BROWSER_RESTART_INTERVAL:
+            print("    ↻ Periodic browser restart (30min interval)")
+            await self.rebuild(reason="periodic restart")
+            self._last_browser_restart = time.time()
+
     async def warm_homepage(self):
         """Load homepage to establish session cookies."""
         self._current_action = "warm_homepage"
@@ -747,23 +857,28 @@ class BackfillClient:
                     continue
                 raise
 
-    async def warm_tournament(self, ut_id: int, season_id: int):
+    async def warm_tournament(self, ut_id: int, season_id: int, country_slug: str = "", competition_slug: str = ""):
         """Load tournament page to get API access."""
-        self._current_action = f"warm_tournament:{ut_id}/{season_id}"
-        url = f"{BROWSER_BASE}/football/unique-tournament/{ut_id}/season/{season_id}"
+        if country_slug and competition_slug:
+            url = f"{BROWSER_BASE}/football/tournament/{country_slug}/{competition_slug}/{ut_id}#id:{season_id}"
+        else:
+            # Backward-compatible fallback for callers/configs without slugs.
+            url = f"{BROWSER_BASE}/football/unique-tournament/{ut_id}/season/{season_id}"
+        self._current_action = f"warm_tournament:{url}"
         for attempt in range(2):
             try:
                 self._response_cache = {}
-                print(f"    ↳ warm_tournament {ut_id}/{season_id} attempt {attempt+1}/2 [{self.telemetry_snapshot()}]")
+                print(f"    ↳ warm_tournament {url} attempt {attempt+1}/2 [{self.telemetry_snapshot()}]")
                 await self.page.goto(url, timeout=30000, wait_until="domcontentloaded")
                 await asyncio.sleep(3)
                 await self._humanize_page()
-                print(f"    ↳ warm_tournament {ut_id}/{season_id} ok [{self.telemetry_snapshot()}]")
+                self._current_tournament_url = url
+                print(f"    ↳ warm_tournament {url} ok [{self.telemetry_snapshot()}]")
                 return
             except PlaywrightError as e:
                 if self.is_recoverable_browser_error(e) and attempt == 0:
                     print(f"    ⚠ Browser transport issue during warm_tournament: {e} [{self.telemetry_snapshot()}]")
-                    await self.rebuild(reason=f"browser transport issue during warm_tournament {ut_id}/{season_id}")
+                    await self.rebuild(reason=f"browser transport issue during warm_tournament {url}")
                     continue
                 raise
 
@@ -806,19 +921,87 @@ class BackfillClient:
             except Exception:
                 pass
 
-        proxy_config = self._build_proxy_config()
-        self.context = await self.browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent=DEFAULT_UA,
-            proxy=proxy_config,
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-        )
-        self.page = await self.context.new_page()
-        self.api_page = await self.context.new_page()
-        self._wire_network_capture()
+        await self._create_context_pages()
         await self.warm_homepage()
 
-    async def fetch_api(self, path: str, timeout_ms: int = 15000, max_retries: int = 3, prefer_capture: bool = False) -> dict:
+    async def _browser_fetch_api(self, path: str, timeout_ms: int) -> dict:
+        headers = {
+            "Referer": self._current_tournament_url or f"{BROWSER_BASE}/",
+            "User-Agent": self._current_ua,
+            **self._current_headers,
+        }
+        await self.api_page.set_extra_http_headers(headers)
+        response = await self.api_page.goto(
+            f"{BROWSER_BASE}{path}",
+            timeout=timeout_ms,
+            wait_until="commit",
+        )
+        if response is None:
+            return {"status": 0, "error": "no response returned"}
+        status = response.status
+        body = None
+        error = None
+        try:
+            body = await response.json()
+        except Exception as json_error:
+            error = str(json_error)
+            try:
+                body = await self.api_page.evaluate("() => document.body.innerText")
+            except Exception:
+                body = None
+        result = {"status": status, "body": body}
+        if error:
+            result["error"] = error
+        return result
+
+    async def _fetch_via_curl_cffi(self, path: str, timeout_ms: int) -> dict:
+        if not HAS_CURL_CFFI or curl_requests is None:
+            return {"status": 0, "error": "curl_cffi unavailable"}
+        cookies = await self.context.cookies(BROWSER_BASE) if self.context else []
+        cookie_dict = {
+            cookie["name"]: cookie["value"]
+            for cookie in cookies
+            if cookie.get("name") and cookie.get("value") is not None
+        }
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": self._current_headers.get("Accept-Language", "en-US,en;q=0.9"),
+            "Origin": BROWSER_BASE,
+            "Referer": self._current_tournament_url or f"{BROWSER_BASE}/",
+            "User-Agent": self._current_ua,
+            "Sec-CH-UA": self._current_headers.get("Sec-CH-UA", get_sec_ch_ua(self._current_ua)),
+            "Sec-CH-UA-Mobile": self._current_headers.get("Sec-CH-UA-Mobile", "?0"),
+            "Sec-CH-UA-Platform": self._current_headers.get("Sec-CH-UA-Platform", '"Windows"'),
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+        proxies = {"https": self._current_proxy_url, "http": self._current_proxy_url} if self._current_proxy_url else None
+        try:
+            response = await asyncio.to_thread(
+                curl_requests.get,
+                f"{BROWSER_BASE}{path}",
+                headers=headers,
+                cookies=cookie_dict,
+                proxies=proxies,
+                impersonate="chrome",
+                timeout=max(1, timeout_ms / 1000),
+            )
+        except Exception as request_error:
+            return {"status": 0, "error": f"curl_cffi request failed: {request_error}"}
+        body = None
+        error = None
+        try:
+            body = response.json()
+        except Exception as json_error:
+            error = str(json_error)
+            body = response.text
+        result = {"status": response.status_code, "body": body, "transport": "curl_cffi"}
+        if error:
+            result["error"] = error
+        return result
+
+    async def fetch_api(self, path: str, timeout_ms: int = 30000, max_retries: int = 3, prefer_capture: bool = False) -> dict:
         """Fetch a SofaScore API endpoint, preferring network-captured browser responses when possible."""
         self._last_api_path = path
         last_result = {"status": 0, "error": "uninitialized"}
@@ -836,28 +1019,12 @@ class BackfillClient:
             self._request_count += 1
             self._current_action = f"fetch_api[{attempt+1}/{max_retries}]"
             try:
-                response = await self.api_page.goto(
-                    f"{BROWSER_BASE}{path}",
-                    timeout=timeout_ms,
-                    wait_until="commit",
-                )
-                if response is None:
-                    result = {"status": 0, "error": "no response returned"}
-                else:
-                    status = response.status
-                    body = None
-                    error = None
-                    try:
-                        body = await response.json()
-                    except Exception as json_error:
-                        error = str(json_error)
-                        try:
-                            body = await self.api_page.evaluate("() => document.body.innerText")
-                        except Exception:
-                            body = None
-                    result = {"status": status, "body": body}
-                    if error:
-                        result["error"] = error
+                result = await self._fetch_via_curl_cffi(path, timeout_ms) if HAS_CURL_CFFI else {"status": 0, "error": "curl_cffi unavailable"}
+                if result.get("status") == 403:
+                    print(f"    ↳ curl_cffi returned 403 for {path}, falling back to browser fetch")
+                    result = await self._browser_fetch_api(path, timeout_ms)
+                elif result.get("status") == 0:
+                    result = await self._browser_fetch_api(path, timeout_ms)
             except PlaywrightError as e:
                 if self.is_recoverable_browser_error(e) and attempt + 1 < max_retries:
                     print(f"    ⚠ Recoverable browser error during fetch_api: {e} [{self.telemetry_snapshot()}]")
@@ -881,7 +1048,7 @@ class BackfillClient:
             await asyncio.sleep(wait)
         return last_result
 
-    async def sleep_between(self, min_s: float = 1.5, max_s: float = 3.0):
+    async def sleep_between(self, min_s: float = 5.0, max_s: float = 10.0):
         """Random sleep between requests."""
         await asyncio.sleep(random.uniform(min_s, max_s))
 
@@ -918,7 +1085,13 @@ class SmokeStatusReporter:
 
 async def _fetch_endpoint_result(client: BackfillClient, endpoint_name: str, eid: int, *, prefer_capture: bool = False):
     path = ENDPOINT_PATHS[endpoint_name].format(event_id=eid)
-    return await client.fetch_api(path, prefer_capture=prefer_capture)
+    phase = ENDPOINT_PHASE[endpoint_name]
+    retry_counts = {"core": 3, "mid": 2, "high": 1}
+    return await client.fetch_api(
+        path,
+        max_retries=retry_counts[phase],
+        prefer_capture=prefer_capture,
+    )
 
 
 async def _process_non_event_endpoint(inserter, endpoint_name: str, eid: int, event_data: dict, result: dict) -> int:
@@ -956,19 +1129,25 @@ async def _run_endpoint_phase(client: BackfillClient, inserter, season_stats: di
             reporter.update(phase="endpoint_pre_sleep", event_id=eid, action=f"endpoint:{endpoint_name}", api_path=ENDPOINT_PATHS[endpoint_name].format(event_id=eid), message=f"pre-sleep before {endpoint_name}", requests=client._request_count, heals=client._heal_count)
         await client.sleep_between(sleep_min, sleep_max)
         result = await _fetch_endpoint_result(client, endpoint_name, eid, prefer_capture=prefer_capture)
+        status = result.get("status")
+        if status == 403 and phase != "core":
+            # Optional endpoints must not prevent the remaining bundle from completing.
+            print(f"    ⚠ endpoint {endpoint_name} HTTP 403 after phase retries; skipping [event={eid}]")
         count = await _process_non_event_endpoint(inserter, endpoint_name, eid, event_data, result)
-        print(f"    ↳ endpoint {endpoint_name} done http={result.get('status')} rows={count} [event={eid}]")
+        print(f"    ↳ endpoint {endpoint_name} done http={status} rows={count} [event={eid}]")
         if reporter:
-            reporter.update(phase="endpoint_done", event_id=eid, action=f"endpoint:{endpoint_name}", api_path=ENDPOINT_PATHS[endpoint_name].format(event_id=eid), http_status=result.get('status'), message=f"{endpoint_name} rows={count}", requests=client._request_count, heals=client._heal_count)
+            reporter.update(phase="endpoint_done", event_id=eid, action=f"endpoint:{endpoint_name}", api_path=ENDPOINT_PATHS[endpoint_name].format(event_id=eid), http_status=status, message=f"{endpoint_name} rows={count}", requests=client._request_count, heals=client._heal_count)
         table_name = ENDPOINT_FETCH_LOG_TABLE[endpoint_name]
         inserter.log_fetch(
             table_name,
             eid,
-            "success" if result.get("status") == 200 else "error",
+            "success" if status == 200 else "error",
             count,
-            None if result.get("status") == 200 else f"HTTP {result.get('status')}",
+            None if status == 200 else f"HTTP {status}",
         )
         season_stats[ENDPOINT_COUNTER_KEY[endpoint_name]] += count
+        if status == 403 and phase == "core":
+            raise RuntimeError(f"{endpoint_name} HTTP 403 after core retries")
 
 
 async def _process_event_with_retries(client: BackfillClient, inserter, progress, season_stats: dict,
@@ -976,6 +1155,7 @@ async def _process_event_with_retries(client: BackfillClient, inserter, progress
                                       *, max_attempts: int = 2,
                                       reporter: Optional[SmokeStatusReporter] = None) -> bool:
     last_error = None
+    await client.maybe_restart_browser()
     for attempt in range(1, max_attempts + 1):
         client.set_event_context(eid, attempt)
         try:
@@ -1665,14 +1845,17 @@ async def backfill_competition(
     ut_id: int,
     cat_id: int,
     season_mode: str,
-    seasons: dict,  # {sid_str: year_label}
+    seasons: dict,  # {sid_str: year_label} or {sid_str: season metadata}
     from_year: int = 2015,
+    to_year: int = 0,
     season_id: Optional[int] = None,
     limit_rounds: int = 0,
     limit_events: int = 0,
     dry_run: bool = False,
     headless: bool = True,
     sticky_session_key: Optional[str] = None,
+    country_slug: str = "",
+    competition_slug: str = "",
 ) -> dict:
     """Backfill one competition."""
     import re
@@ -1692,17 +1875,21 @@ async def backfill_competition(
             return int(m.group(1))
         return 0
 
-    target_seasons = {
-        int(sid): label for sid, label in seasons.items()
-        if season_start_year(label) >= from_year
-    }
+    target_seasons = {}
+    for sid, season_data in seasons.items():
+        if isinstance(season_data, dict):
+            label = str(season_data.get("year", season_data.get("name", sid)))
+        else:
+            label = str(season_data)
+        if season_start_year(label) >= from_year and (to_year == 0 or season_start_year(label) <= to_year):
+            target_seasons[int(sid)] = season_data
     if season_id is not None:
         target_seasons = {sid: label for sid, label in target_seasons.items() if sid == season_id}
         if not target_seasons:
             target_seasons = {season_id: str(season_id)}
 
     print(f"\n{'='*60}")
-    print(f"🏆 {name} — {len(target_seasons)} seasons (from {from_year})")
+    print(f"🏆 {name} — {len(target_seasons)} seasons ({from_year}-{to_year if to_year else 'now'})")
     print(f"{'='*60}")
 
     results = {"competition": name, "seasons": {}}
@@ -1717,7 +1904,8 @@ async def backfill_competition(
         reporter.update(phase="warm_homepage_done", action="warm_homepage", message="homepage warmed", requests=client._request_count, heals=client._heal_count)
         print(f"✅ Session warmed")
 
-        for sid, label in sorted(target_seasons.items()):
+        for sid, season_data in sorted(target_seasons.items()):
+            label = str(season_data.get("year", season_data.get("name", sid))) if isinstance(season_data, dict) else str(season_data)
             print(f"\n📅 Season {label} (SID={sid})")
             reporter.update(phase="season_start", season_id=sid, season_label=label, action="season_start", message=f"season {label} start")
 
@@ -1743,8 +1931,8 @@ async def backfill_competition(
             # Warm tournament page
             try:
                 reporter.update(phase="warm_tournament", season_id=sid, season_label=label, action="warm_tournament", message=f"warming tournament {ut_id}/{sid}", requests=client._request_count, heals=client._heal_count)
-                await client.warm_tournament(ut_id, sid)
-                reporter.update(phase="warm_tournament_done", season_id=sid, season_label=label, action="warm_tournament", message=f"tournament {ut_id}/{sid} warmed", requests=client._request_count, heals=client._heal_count)
+                await client.warm_tournament(ut_id, sid, country_slug, competition_slug)
+                reporter.update(phase="warm_tournament_done", season_id=sid, season_label=label, action="warm_tournament", message=f"tournament {country_slug}/{competition_slug}/{ut_id}#id:{sid} warmed", requests=client._request_count, heals=client._heal_count)
             except Exception as e:
                 print(f"  ❌ Failed to warm tournament page: {e}")
                 results["seasons"][sid] = {"status": "error", "reason": str(e)}
@@ -1861,7 +2049,7 @@ def run_test_match_json(path: str) -> dict:
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def load_competitions() -> dict:
-    """Load competitions from YAML + discoveries.json."""
+    """Load competitions from YAML, discoveries.json, and verified season URLs."""
     try:
         import yaml
         with open(COMPETITIONS_FILE) as f:
@@ -1875,15 +2063,41 @@ def load_competitions() -> dict:
     if DISCOVERIES_FILE.exists():
         discoveries = json.loads(DISCOVERIES_FILE.read_text())
 
+    verified = {}
+    if SEASON_URLS_FILE.exists():
+        try:
+            verified = {
+                item["name"]: item
+                for item in json.loads(SEASON_URLS_FILE.read_text()).get("competitions", [])
+                if item.get("name")
+            }
+        except (OSError, json.JSONDecodeError, TypeError):
+            verified = {}
+
     # Merge
     result = {}
     for name, cfg in yaml_comps.items():
         disc = discoveries.get(name, {})
-        seasons = disc.get("seasons", {})
+        verified_cfg = verified.get(name, {})
+        seasons = {}
+        if isinstance(verified_cfg.get("seasons"), list):
+            for season in verified_cfg["seasons"]:
+                if not isinstance(season, dict) or season.get("id") is None:
+                    continue
+                sid = str(season["id"])
+                seasons[sid] = {
+                    "year": season.get("year", sid),
+                    "id": season["id"],
+                    "url": season.get("url"),
+                }
+        if not seasons:
+            seasons = disc.get("seasons", {})
         result[name] = {
             "ut_id": cfg.get("ut_id"),
             "cat_id": cfg.get("category_id"),
             "season_mode": cfg.get("season_mode", "national"),
+            "country_slug": verified_cfg.get("country_slug", cfg.get("country_slug", "")),
+            "competition_slug": verified_cfg.get("competition_slug", cfg.get("competition_slug", "")),
             "seasons": seasons,
         }
     return result
@@ -1894,6 +2108,7 @@ async def main():
     ap.add_argument("--all", action="store_true", help="Run all competitions")
     ap.add_argument("--competition", type=str, help="Single competition name")
     ap.add_argument("--from-year", type=int, default=2015, help="Start year (default 2015)")
+    ap.add_argument("--to-year", type=int, default=0, help="End year (0=no limit, e.g. 2024)")
     ap.add_argument("--season-id", type=int, help="Restrict to one SofaScore season ID")
     ap.add_argument("--limit-rounds", type=int, default=0, help="Limit rounds per season (0=all)")
     ap.add_argument("--limit-events", type=int, default=0, help="Limit events (0=all)")
@@ -1923,7 +2138,10 @@ async def main():
             cat_id=comp["cat_id"],
             season_mode=comp["season_mode"],
             seasons=comp["seasons"],
+            country_slug=comp.get("country_slug", ""),
+            competition_slug=comp.get("competition_slug", ""),
             from_year=args.from_year,
+            to_year=args.to_year,
             season_id=args.season_id,
             limit_rounds=args.limit_rounds,
             limit_events=args.limit_events,
@@ -1947,7 +2165,10 @@ async def main():
                 cat_id=comp["cat_id"],
                 season_mode=comp["season_mode"],
                 seasons=comp["seasons"],
+                country_slug=comp.get("country_slug", ""),
+                competition_slug=comp.get("competition_slug", ""),
                 from_year=args.from_year,
+                to_year=args.to_year,
                 limit_rounds=args.limit_rounds,
                 limit_events=args.limit_events,
                 dry_run=args.dry_run,
@@ -1957,10 +2178,18 @@ async def main():
             # Small delay between competitions
             await asyncio.sleep(5)
     else:
-        print("Usage: backfill_runner.py --all | --competition NAME [--from-year 2015] [--limit-rounds N] [--dry-run]")
+        print("Usage: backfill_runner.py --all | --competition NAME [--from-year 2015] [--to-year 2024] [--limit-rounds N] [--dry-run]")
         print("       backfill_runner.py --test-match-json match_14023966_full.json")
         print(f"\nAvailable competitions: {', '.join(sorted(competitions.keys()))}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n⏹ Interrupted by user")
+    except Exception as e:
+        print(f"\n💥 Fatal error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

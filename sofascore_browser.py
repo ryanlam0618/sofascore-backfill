@@ -50,6 +50,61 @@ BLOCKED_THIRD_PARTY_DOMAINS = (
 
 BLOCKED_RESOURCE_TYPES = {"image", "stylesheet", "font", "media"}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Fingerprint protection script (synced from OddsHarvester)
+# ─────────────────────────────────────────────────────────────────────────────
+FINGERPRINT_PROTECT_SCRIPT = """
+(function() {
+    // Canvas fingerprinting protection — add small random noise to pixels
+    const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+    CanvasRenderingContext2D.prototype.getImageData = function(sx, sy, sw, sh) {
+        const imageData = originalGetImageData.call(this, sx, sy, sw, sh);
+        const data = imageData.data;
+        for (let i = 0; i < data.length; i += 4) {
+            data[i]   = Math.min(255, data[i]   + Math.floor(Math.random() * 3 - 1));
+            data[i+1] = Math.min(255, data[i+1] + Math.floor(Math.random() * 3 - 1));
+            data[i+2] = Math.min(255, data[i+2] + Math.floor(Math.random() * 3 - 1));
+        }
+        return imageData;
+    };
+
+    // WebGL fingerprinting protection
+    const getParameter = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(param) {
+        if (param === 37445) return 'Intel Inc.';           // UNMASKED_VENDOR_WEBGL
+        if (param === 37446) return 'Intel Iris OpenGL Engine';  // UNMASKED_RENDERER_WEBGL
+        return getParameter.call(this, param);
+    };
+
+    const getExtension = WebGLRenderingContext.prototype.getExtension;
+    WebGLRenderingContext.prototype.getExtension = function(name) {
+        if (name === 'WEBGL_debug_renderer_info') return null;
+        return getExtension.call(this, name);
+    };
+
+    // AudioContext fingerprinting protection
+    const originalCreateDynamicsCompressor = AudioContext.prototype.createDynamicsCompressor;
+    AudioContext.prototype.createDynamicsCompressor = function() {
+        try {
+            const compressor = originalCreateDynamicsCompressor.call(this);
+            const originalGetValueAtTime = compressor.threshold.getValueAtTime;
+            compressor.threshold.getValueAtAtTime = function(value, time) {
+                return originalGetValueAtTime.call(this, value + (Math.random() * 0.1 - 0.05), time);
+            };
+            return compressor;
+        } catch(e) {
+            return originalCreateDynamicsCompressor.call(this);
+        }
+    };
+
+    // Spoof navigator.languages
+    Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-US', 'en', 'zh-Hant', 'zh'],
+        enumerable: true
+    });
+})();
+"""
+
 
 @dataclass(frozen=True)
 class EndpointSpec:
@@ -216,7 +271,7 @@ class SofaScoreBrowserClient:
         if self.sticky_session_key:
             proxy_username = f"{proxy_username}-session-{self.sticky_session_key}"
         self.context = await self.browser.new_context(
-            viewport={"width": 1920, "height": 1080},
+            viewport={"width": random.randint(1366, 1920), "height": random.randint(768, 1080)},
             user_agent=DEFAULT_USER_AGENT,
             proxy={
                 "server": PROXY_SERVER,
@@ -225,6 +280,8 @@ class SofaScoreBrowserClient:
             } if PROXY_SERVER else None,
             extra_http_headers={"Accept-Language": DEFAULT_ACCEPT_LANGUAGE},
         )
+        # Inject fingerprint protection (Canvas/WebGL/Audio + languages)
+        await self.context.add_init_script(FINGERPRINT_PROTECT_SCRIPT)
         self.page = await self.context.new_page()
         await self._block_unneeded_resources(self.page)
         return self

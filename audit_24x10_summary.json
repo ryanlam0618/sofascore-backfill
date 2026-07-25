@@ -1,0 +1,14 @@
+{
+  "rows": 300,
+  "ok_count": 1,
+  "non_ok_count": 299,
+  "afc_two_probe": {
+    "page_status": 200,
+    "final_url": "https://www.sofascore.com/football/tournament/asia/afc-cup/668#id:97465",
+    "current_season_id": "97465",
+    "current_label": "26/27",
+    "note": "derived from live tournament page because /seasons endpoint returns 403"
+  },
+  "json": "/root/.openclaw/workspace/sofascore-backfill/audit_24x10_results.json",
+  "csv": "/root/.openclaw/workspace/sofascore-backfill/audit_24x10_results.csv"
+}

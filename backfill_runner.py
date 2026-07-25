@@ -520,6 +520,10 @@ class ProgressTracker:
     def mark_done(self, event_id: int):
         if event_id not in self._state["events_done"]:
             self._state["events_done"].append(event_id)
+        self._state["events_failed"] = [
+            item for item in self._state.get("events_failed", [])
+            if (item.get("id") if isinstance(item, dict) else item) != event_id
+        ]
         self.save()
 
     def mark_failed(self, event_id: int, reason: str = ""):

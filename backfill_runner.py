@@ -289,27 +289,16 @@ CORE_ENDPOINTS: Sequence[str] = ("event", "incidents", "lineups")
 MID_RISK_ENDPOINTS: Sequence[str] = ("statistics", "shotmap")
 HIGH_RISK_ENDPOINTS: Sequence[str] = ("graph", "odds", "comments")
 
-BLOCKED_THIRD_PARTY_DOMAINS: Sequence[str] = (
-    "smartadserver.com",
-    "googleadservices.com",
-    "googlesyndication.com",
-    "doubleclick.net",
-    "googletagmanager.com",
-    "google-analytics.com",
-    "adverge.ai",
-    "liadm.com",
-    "criteo.com",
-    "id5-sync",
-    "a-mx.com",
-    "a-mo.net",
-    "crwdcntrl.net",
-    "challenges.cloudflare.com",
-    "jsdelivr.net",
-    "digitaloceanspaces.com",
-    "clipro.tv",
-    "mvp.fan",
-    "sentry.io",
-    "firebaseinstallations.googleapis.com",
+# ── Allowed domains for route filtering (allowlist) ───────────────────
+# Only allow SofaScore + essential infrastructure through the proxy.
+ALLOWED_DOMAINS: Sequence[str] = (
+    "sofascore.com",          # www, ws, api
+    "jsdelivr.net",            # CDN for JS/CSS
+    "unpkg.com",               # npm CDN
+    "googleapis.com",          # firebase.googleapis.com, firebaseinstallations
+    "google.com",              # accounts.google.com (auth)
+    "ipapi.co",                # IP geolocation (for content localization)
+    "ip-api.com",              # fallback IP geolocation
 )
 
 BLOCKED_RESOURCE_TYPES = {"image", "stylesheet", "font", "media"}
@@ -654,14 +643,15 @@ class BackfillClient:
         return page
 
     async def _block_unneeded_resources(self, page):
+        """Allowlist: only pass essential domains through proxy."""
         async def handle_route(route):
             request = route.request
             host = (urlparse(request.url).hostname or "").lower()
-            should_block_host = any(
+            allowed = any(
                 host == domain or host.endswith(f".{domain}")
-                for domain in BLOCKED_THIRD_PARTY_DOMAINS
+                for domain in ALLOWED_DOMAINS
             )
-            if request.resource_type in BLOCKED_RESOURCE_TYPES or should_block_host:
+            if not allowed or request.resource_type in BLOCKED_RESOURCE_TYPES:
                 await route.abort()
                 return
             await route.continue_()

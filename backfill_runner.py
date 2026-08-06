@@ -296,6 +296,20 @@ BLOCKED_THIRD_PARTY_DOMAINS: Sequence[str] = (
     "doubleclick.net",
     "googletagmanager.com",
     "google-analytics.com",
+    "adverge.ai",
+    "liadm.com",
+    "criteo.com",
+    "id5-sync",
+    "a-mx.com",
+    "a-mo.net",
+    "crwdcntrl.net",
+    "challenges.cloudflare.com",
+    "jsdelivr.net",
+    "digitaloceanspaces.com",
+    "clipro.tv",
+    "mvp.fan",
+    "sentry.io",
+    "firebaseinstallations.googleapis.com",
 )
 
 BLOCKED_RESOURCE_TYPES = {"image", "stylesheet", "font", "media"}
@@ -907,6 +921,65 @@ class BackfillClient:
                     continue
                 raise
 
+    async def get_event_ssr(self, path: Optional[str] = None) -> Optional[dict]:
+        """Extract the loaded event page's ``__NEXT_DATA__`` payload."""
+        if not self.page:
+            return None
+        raw = await self.page.evaluate(
+            """
+            () => {
+              const el = document.querySelector('#__NEXT_DATA__');
+              if (!el || !el.textContent) return null;
+              try { return JSON.parse(el.textContent); }
+              catch (error) { return null; }
+            }
+            """
+        )
+        return self._map_ssr_to_api_format(raw, path)
+
+    @staticmethod
+    def _map_ssr_to_api_format(raw: Any, path: Optional[str] = None) -> Optional[dict]:
+        """Map one endpoint's value in a Next.js hydration tree to API shape."""
+        if not isinstance(raw, (dict, list)):
+            return None
+        match = re.search(r"/event/[^/]+/([^/?]+)", path or "")
+        endpoint = match.group(1) if match else ("event" if "/event/" in (path or "") else None)
+        aliases = {
+            "event": ("event",), "incidents": ("incidents",),
+            "lineups": ("lineups", "lineup"), "statistics": ("statistics", "stats"),
+            "shotmap": ("shotmap", "shotMap"), "graph": ("graph",),
+            "odds": ("odds",), "comments": ("comments",),
+        }
+        wanted = aliases.get(endpoint, (endpoint,)) if endpoint else ()
+
+        def walk(value: Any) -> Optional[Any]:
+            if isinstance(value, dict):
+                for key in wanted:
+                    if key in value and value[key] is not None:
+                        return value[key]
+                for child in value.values():
+                    found = walk(child)
+                    if found is not None:
+                        return found
+            elif isinstance(value, list):
+                for child in value:
+                    found = walk(child)
+                    if found is not None:
+                        return found
+            return None
+
+        value = walk(raw) if wanted else None
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, json.JSONDecodeError):
+                return None
+        if not isinstance(value, (dict, list)) or not value:
+            return None
+        return {"event": value} if endpoint == "event" else {endpoint: value}
+
     async def rotate_context(self):
         """Create a fresh browser context; sticky sessions keep the same IP/session unless session key changes."""
         if self.api_page:
@@ -1005,23 +1078,35 @@ class BackfillClient:
             result["error"] = error
         return result
 
-    async def fetch_api(self, path: str, timeout_ms: int = 30000, max_retries: int = 3, prefer_capture: bool = False) -> dict:
-        """Fetch a SofaScore API endpoint, preferring network-captured browser responses when possible."""
+    async def fetch_api(self, path: str, timeout_ms: int = 30000, max_retries: int = 5, prefer_capture: bool = False) -> dict:
+        """Fetch a SofaScoreet endpoint, rotating proxy on 403, falling back to SSR as last resort."""
         self._last_api_path = path
         last_result = {"status": 0, "error": "uninitialized"}
-        print(f"    ↳ fetch_api start {path} prefer_capture={prefer_capture} timeout_ms={timeout_ms} [{self.telemetry_snapshot()}]")
+        print(f"    ↳ fetch_api start {path} prefer_capture={prefer_capture} proxy_tries={max_retries} [{self.telemetry_snapshot()}]")
 
+        # ── Phase 1: network capture (prefer_capture) ──────────────────────────────────
         if prefer_capture and self._network_capture_enabled:
             captured = await self._wait_for_captured_response(path, timeout_ms=timeout_ms)
             if captured is not None:
                 print(f"    ↳ capture hit for {path}: HTTP {captured.get('status')}")
-                self._consecutive_403 = 0 if captured.get("status") != 403 else self._consecutive_403 + 1
-                return captured
+                if captured.get("status") != 403:
+                    self._consecutive_403 = 0
+                    return captured
+                self._consecutive_403 += 1
+                print(f"    ↳ capture returned 403 for {path}, rotating proxy and retrying")
             print(f"    ↳ capture miss for {path}, falling back to direct fetch")
 
+        # ── Phase 2: proxy rotation loop ───────────────────────────────────────────────
         for attempt in range(max_retries):
             self._request_count += 1
             self._current_action = f"fetch_api[{attempt+1}/{max_retries}]"
+
+            # Rotate proxy before every retry (first attempt uses current context)
+            if attempt > 0:
+                print(f"    🔄 Rotating proxy [{attempt}/{max_retries}] [{self.telemetry_snapshot()}]")
+                await self.rotate_context()
+                await asyncio.sleep(random.uniform(1.5, 3.0))
+
             try:
                 result = await self._fetch_via_curl_cffi(path, timeout_ms) if HAS_CURL_CFFI else {"status": 0, "error": "curl_cffi unavailable"}
                 if result.get("status") == 403:
@@ -1035,21 +1120,24 @@ class BackfillClient:
                     await self.rebuild(reason=f"recoverable browser error during fetch_api {path}")
                     continue
                 raise
+
             last_result = result
-            print(f"    ↳ fetch_api result {path}: HTTP {result.get('status')} [{self.telemetry_snapshot()}]")
-            if result.get("status") != 403:
+            status = result.get("status")
+            print(f"    ↳ fetch_api result {path}: HTTP {status} (proxy #{attempt+1}/{max_retries}) [{self.telemetry_snapshot()}]")
+            if status != 403:
                 self._consecutive_403 = 0
                 return result
+
             self._consecutive_403 += 1
-            phase = "high" if any(token in path for token in ("/graph", "/odds/", "/comments")) else ("mid" if any(token in path for token in ("/statistics", "/shotmap")) else "core")
-            base_wait = {"core": 4.0, "mid": 12.0, "high": 25.0}[phase]
-            wait = base_wait * (attempt + 1) + random.uniform(0.8, 2.2)
-            if self._consecutive_403 >= 5:
-                wait = max(wait, 45 + random.uniform(0, 8))
-            if self._consecutive_403 >= 10:
-                wait = max(wait, 120 + random.uniform(0, 15))
-            print(f"    ⚠ 403 on {path} (attempt {attempt+1}/{max_retries}), cooling down {wait:.1f}s on sticky session...")
-            await asyncio.sleep(wait)
+
+        # ── Phase 3: SSR fallback (all proxy rotations exhausted) ───────────────────────
+        if last_result.get("status") == 403:
+            ssr_result = await self.get_event_ssr(path)
+            if ssr_result is not None:
+                print(f"    ↳ SSR fallback hit for {path} (after {max_retries} proxy rotations)")
+                self._consecutive_403 = 0
+                return {"status": 200, "body": ssr_result, "transport": "ssr"}
+            print(f"    ⚠ All {max_retries} proxies + SSR exhausted for {path}, giving up")
         return last_result
 
     async def sleep_between(self, min_s: float = 5.0, max_s: float = 10.0):
@@ -1102,6 +1190,15 @@ async def _process_non_event_endpoint(inserter, endpoint_name: str, eid: int, ev
     if result.get("status") != 200:
         return 0
     body = result.get("body", {})
+    # Safety net: browser fallback may return the API body as a JSON string.
+    if isinstance(body, str):
+        import json as _json
+        try:
+            body = _json.loads(body)
+        except Exception:
+            pass
+    if not isinstance(body, dict):
+        return 0
     if endpoint_name in {"incidents", "lineups", "shotmap"} and isinstance(body, dict) and event_data:
         body.setdefault("homeTeam", event_data.get("homeTeam", {}))
         body.setdefault("awayTeam", event_data.get("awayTeam", {}))
@@ -1186,12 +1283,20 @@ async def _process_event_with_retries(client: BackfillClient, inserter, progress
                 season_stats["failed"] += 1
                 return False
 
-            event_data = event_result.get("body", {}).get("event", {})
+            _ev_body = event_result.get("body", {})
+            if isinstance(_ev_body, str):
+                import json as _json
+                try:
+                    _ev_body = _json.loads(_ev_body)
+                except Exception:
+                    _ev_body = {}
+            event_data = _ev_body.get("event", {}) if isinstance(_ev_body, dict) else {}
             if event_data:
                 inserter.insert_match(event_data, sid, competition_id)
 
             await _run_endpoint_phase(client, inserter, season_stats, eid, event_data, CORE_ENDPOINTS[1:], prefer_capture=True, reporter=reporter)
-            await _run_endpoint_phase(client, inserter, season_stats, eid, event_data, MID_RISK_ENDPOINTS, prefer_capture=True, reporter=reporter)
+            await _run_endpoint_phase(client, inserter, season_stats, eid, event_data, ("statistics",), prefer_capture=False, reporter=reporter)
+            await _run_endpoint_phase(client, inserter, season_stats, eid, event_data, ("shotmap",), prefer_capture=True, reporter=reporter)
             await _run_endpoint_phase(client, inserter, season_stats, eid, event_data, HIGH_RISK_ENDPOINTS, prefer_capture=False, reporter=reporter)
 
             progress.mark_done(eid)

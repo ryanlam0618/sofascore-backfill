@@ -101,6 +101,8 @@ async def main() -> int:
         for eid in failed:
             queue.append((path, comp_name, sid, eid))
 
+    random.shuffle(queue)
+
     print(f"failed_event_queue={len(queue)}")
     for path, comp_name, sid, eid in queue[:20]:
         print(f"QUEUE {comp_name} season={sid} event={eid} progress={path.name}")
@@ -112,55 +114,71 @@ async def main() -> int:
         return 0
 
     max_events = len(queue) if args.max_events == 0 else min(args.max_events, len(queue))
+    batch_size = 25
     processed = 0
     succeeded = 0
     failed = 0
+    batch_num = 0
 
-    async with runner.BackfillClient(
-        headless=not args.headful,
-        sticky_session_key=args.sticky_session_key,
-    ) as client:
-        await client.warm_homepage()
-        for path, comp_name, sid, eid in queue[:max_events]:
-            competition_id = season_competition_ids[sid]
-            progress = runner.ProgressTracker(path)
-            if progress.is_done(eid):
-                print(f"SKIP already done event={eid}")
-                continue
-            season_stats = {
-                "processed": 0,
-                "skipped": 0,
-                "failed": 0,
-                "incidents": 0,
-                "lineups": 0,
-                "statistics": 0,
-                "shotmap": 0,
-                "graph": 0,
-                "odds": 0,
-                "comments": 0,
-            }
-            processed += 1
-            print(f"\nRETRY {processed}/{max_events} {comp_name} season={sid} event={eid}")
-            ok = await runner._process_event_with_retries(
-                client,
-                inserter,
-                progress,
-                season_stats,
-                eid,
-                sid,
-                competition_id,
-                reporter=None,
-            )
-            if ok:
-                succeeded += 1
-                print(f"OK event={eid} stats={season_stats}")
-            else:
-                failed += 1
-                print(f"FAIL event={eid} stats={season_stats}")
-            if processed < max_events:
-                sleep_s = random.uniform(args.sleep_min, args.sleep_max)
-                print(f"sleep={sleep_s:.1f}s")
-                await asyncio.sleep(sleep_s)
+    while processed < max_events:
+        batch_end = min(processed + batch_size, max_events)
+        batch_num += 1
+        session_key = f"rerun-w4-batch-{batch_num}"
+        async with runner.BackfillClient(
+            headless=not args.headful,
+            sticky_session_key=session_key,
+        ) as client:
+            await client.warm_homepage()
+            for path, comp_name, sid, eid in queue[processed:batch_end]:
+                processed += 1
+                competition_id = season_competition_ids[sid]
+                progress = runner.ProgressTracker(path)
+                if progress.is_done(eid):
+                    print(f"SKIP already done event={eid}")
+                    continue
+                season_stats = {
+                    "processed": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                    "incidents": 0,
+                    "lineups": 0,
+                    "statistics": 0,
+                    "shotmap": 0,
+                    "graph": 0,
+                    "odds": 0,
+                    "comments": 0,
+                }
+                print(f"\nRETRY {processed}/{max_events} {comp_name} season={sid} event={eid}")
+                ok = await runner._process_event_with_retries(
+                    client,
+                    inserter,
+                    progress,
+                    season_stats,
+                    eid,
+                    sid,
+                    competition_id,
+                    reporter=None,
+                )
+                if ok:
+                    succeeded += 1
+                    print(f"OK event={eid} stats={season_stats}")
+                else:
+                    failed += 1
+                    print(f"FAIL event={eid} stats={season_stats}")
+                if processed < batch_end:
+                    sleep_s = (
+                        random.uniform(60, 90)
+                        if not ok
+                        else random.uniform(args.sleep_min, args.sleep_max)
+                    )
+                    print(f"sleep={sleep_s:.1f}s")
+                    await asyncio.sleep(sleep_s)
+
+        print(f"\n=== Batch {batch_num} done (events {processed}/{max_events}) ===")
+        if processed < max_events:
+            sleep_s = random.uniform(5, 10)
+            print(f"Batch pause {sleep_s:.1f}s for IP rotation")
+            await asyncio.sleep(sleep_s)
 
     conn.close()
     print(f"\nSUMMARY processed={processed} succeeded={succeeded} failed={failed} remaining_initial={len(queue) - processed}")

@@ -37,3 +37,4 @@ proxy_list.txt
 .DS_Store
 .vscode/
 .idea/
+*.db

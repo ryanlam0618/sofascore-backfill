@@ -50,6 +50,33 @@ def _first_non_empty(*values):
     return None
 
 
+def _stat_value(stats, json_key):
+    """Fetch one statistic value, coercing nested dict/list to a scalar-safe form.
+
+    SofaScore embeds a few nested objects in a player's ``statistics`` payload:
+      - ``statisticsType`` -> ``{"sportSlug": "football", "statisticsType": "player"}``
+      - ``ratingVersions`` -> ``{"original": 6.5, "alternative": 6.6}``
+    MySQL scalar/json columns cannot store a Python dict/list (raises
+    ``MySQLInterfaceError: Python type dict cannot be converted``), so coerce:
+      - dict -> inner ``statisticsType`` string when present (best fidelity), else json
+      - list -> json string
+      - otherwise unchanged
+    This keeps the ``insert_player_stats`` write path resilient to future API shape
+    changes without a schema migration.
+    """
+    if not isinstance(stats, dict):
+        return None
+    v = stats.get(json_key)
+    if isinstance(v, dict):
+        inner = v.get("statisticsType")
+        if isinstance(inner, str):
+            return inner
+        return json.dumps(v, separators=(",", ":"))
+    if isinstance(v, list):
+        return json.dumps(v, separators=(",", ":"))
+    return v
+
+
 def _normalize_country_code(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
@@ -1424,8 +1451,40 @@ async def discover_season_event_ids(
 class DataInserter:
     """Insert fetched data into MySQL."""
 
+    # MySQL error codes that are safe to retry: deadlock (1213) and
+    # lock-wait timeout (1205). InnoDB rolls back the victim transaction,
+    # so re-running the insert is the correct recovery.
+    RETRYABLE_MYSQL_ERRNOS = (1213, 1205)
+
     def __init__(self, mysql_conn):
         self.conn = mysql_conn
+
+    def _retry_deadlock(self, fn, *args, retries: int = 3, **kwargs):
+        """Run ``fn`` and retry on MySQL deadlock / lock-wait timeout.
+
+        Concurrency bug: 8 parallel Batch workers share the same InnoDB
+        ``match_odds`` / ``match_momentum`` / ``match_average_positions``
+        tables with DELETE+INSERT / gap-lock contention, producing
+        ``InternalError 1213 (40001) Deadlock found``. Retrying the whole
+        statement after a short backoff recovers those writes (the victim
+        transaction is fully rolled back by InnoDB).
+        """
+        attempt = 0
+        while True:
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:  # noqa: BLE001 - retry only InnoDB errors
+                errno = getattr(e, "errno", None)
+                if errno in self.RETRYABLE_MYSQL_ERRNOS and attempt < retries:
+                    attempt += 1
+                    backoff = 0.1 * (2 ** attempt)
+                    time.sleep(backoff)
+                    try:
+                        self.conn.rollback()
+                    except Exception:
+                        pass
+                    continue
+                raise
 
     def insert_match(self, event: dict, season_id: int, competition_id: int) -> int:
         """Insert or update a match, return match_id."""
@@ -1506,13 +1565,31 @@ class DataInserter:
             return 0
 
         cur = self.conn.cursor()
+        home_team = data.get("homeTeam") or {}
+        away_team = data.get("awayTeam") or {}
+        raw_home = data.get("home") or {}
+        raw_away = data.get("away") or {}
+        if not home_team.get("id") and raw_home.get("id"):
+            home_team = raw_home
+        if not away_team.get("id") and raw_away.get("id"):
+            away_team = raw_away
+        if not home_team.get("id") or not away_team.get("id"):
+            cur.execute("SELECT home_team_id, away_team_id FROM matches WHERE match_id=%s", (match_id,))
+            row = cur.fetchone()
+            if row:
+                if not home_team.get("id"):
+                    home_team = {"id": row[0]}
+                if not away_team.get("id"):
+                    away_team = {"id": row[1]}
         count = 0
         for inc in incidents:
             inc_id = inc.get("id")
             if not inc_id:
                 continue
             team = inc.get("team", {})
-            player = inc.get("player", {})
+            player = inc.get("player") or inc.get("playerIn") or {}
+            related_player = inc.get("relatedPlayer") or inc.get("playerOut") or {}
+            assist_player = inc.get("assist") or {}
             inc_type = inc.get("incidentType") or inc.get("type", "")
 
             type_map = {
@@ -1526,8 +1603,19 @@ class DataInserter:
             if mapped_type not in ("goal", "card", "substitution", "period", "var"):
                 mapped_type = "goal"
 
+            minute = self._incident_minute(inc)
             period_map = {"1ST": "first", "2ND": "second", "ET1": "extra_first", "ET2": "extra_second"}
-            period = period_map.get(inc.get("period", "").upper(), "first")
+            raw_period = inc.get("period")
+            if raw_period:
+                period = period_map.get(str(raw_period).upper(), "first")
+            elif minute <= 45:
+                period = "first"
+            elif minute <= 90:
+                period = "second"
+            elif minute <= 105:
+                period = "extra_first"
+            else:
+                period = "extra_second"
 
             goal_type = None
             card_type = None
@@ -1539,13 +1627,10 @@ class DataInserter:
                 ct_map = {"yellow": "yellow", "red": "red", "yellowRed": "yellow_red"}
                 card_type = ct_map.get(inc_class)
 
-            home_team = data.get("homeTeam", {})
-            away_team = data.get("awayTeam", {})
             team_id = team.get("id") if team else None
 
             # SofaScore incidents don't have a nested "team" object; they use
             # "isHome" to indicate which side the incident belongs to.
-            # Derive team_id from the match's homeTeam/awayTeam + isHome.
             if team_id is None:
                 if inc.get("isHome") is True:
                     team_id = home_team.get("id")
@@ -1560,28 +1645,30 @@ class DataInserter:
 
             is_home = 1 if team_id == home_team.get("id") else 0
 
-            if player.get("id"):
-                ensure_player(
-                    self.conn,
-                    player["id"],
-                    player.get("name", ""),
-                    player.get("shortName", ""),
-                    player.get("position"),
-                    player.get("countryCode"),
-                    player,
-                    team_id,
-                )
+            for person in (player, related_player, assist_player):
+                if person.get("id"):
+                    ensure_player(
+                        self.conn,
+                        person["id"],
+                        person.get("name", ""),
+                        person.get("shortName", ""),
+                        person.get("position"),
+                        person.get("countryCode"),
+                        person,
+                        team_id,
+                    )
 
             cur.execute(
                 """INSERT INTO match_incidents
-                       (incident_id, match_id, team_id, player_id, incident_type, minute,
+                       (incident_id, match_id, team_id, player_id, related_player_id,
+                        assist_player_id, incident_type, minute, added_time,
                         period, is_home, goal_type, card_type, incident_text, reason)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                    ON DUPLICATE KEY UPDATE incident_text=VALUES(incident_text)
                 """,
-                (inc_id, match_id, team_id, player.get("id"), mapped_type,
-                 self._incident_minute(inc), period, is_home, goal_type, card_type,
-                 inc.get("text"), inc.get("reason")),
+                (inc_id, match_id, team_id, player.get("id"), related_player.get("id"),
+                 assist_player.get("id"), mapped_type, minute, inc.get("addedTime"), period,
+                 is_home, goal_type, card_type, inc.get("text"), inc.get("reason")),
             )
             count += 1
         self.conn.commit()
@@ -1680,7 +1767,11 @@ class DataInserter:
         return count
 
     def insert_player_stats(self, match_id: int, player_entry: dict, team_id: int, is_home: int, commit: bool = True):
-        """Insert per-player statistics from a lineups player entry."""
+        """Insert per-player statistics from a lineups player entry.
+
+        Typed columns support analytics while raw JSON preserves new SofaScore
+        fields without requiring a schema migration for every API addition.
+        """
         if not player_entry or not isinstance(player_entry, dict):
             return 0
         player = player_entry.get("player", {})
@@ -1698,10 +1789,15 @@ class DataInserter:
             "is_home": is_home,
         }
         for column, json_key in LEGACY_PLAYER_STAT_MAPPING.items():
-            values[column] = stats.get(json_key)
+            values[column] = _stat_value(stats, json_key)
         values["minutes_played"] = _first_non_empty(values.get("minutes_played"), player_entry.get("minutesPlayed"), player_entry.get("minutes"), 0)
         for column, json_key in PLAYER_STAT_JSON_KEYS.items():
-            values[column] = stats.get(json_key)
+            values[column] = _stat_value(stats, json_key)
+        values["statistics_type"] = _stat_value(stats, "statisticsType")
+        # rating_versions is a dict -> _stat_value json-serialises it for the json column;
+        # a bare scalar (rare) passes through unchanged.
+        values["rating_versions"] = _stat_value(stats, "ratingVersions")
+        values["raw_statistics"] = json.dumps(stats, separators=(",", ":"))
 
         columns = list(values.keys())
         placeholders = ", ".join(["%s"] * len(columns))
@@ -1839,7 +1935,7 @@ class DataInserter:
                  shot.get("time"), shot.get("incidentType"), shot.get("shotType"),
                  shot.get("situation"), shot.get("bodyPart"),
                  player_coords.get("x"), player_coords.get("y"), player_coords.get("z"),
-                 shot.get("xg"), shot.get("xgot"), 1 if shot.get("isGoal") else 0,
+                 shot.get("xg"), shot.get("xgot"), 1 if shot.get("shotType") == "goal" else 0,
                  shot.get("goalMouthLocation"), goal_coords.get("x"), goal_coords.get("y"), goal_coords.get("z"),
                  block_coords.get("x"), block_coords.get("y"), block_coords.get("z"),
                  goalkeeper.get("id"), goalkeeper.get("name"),
@@ -1851,6 +1947,9 @@ class DataInserter:
 
     def insert_graph_points(self, match_id: int, data: dict):
         """Insert SofaScore momentum graph points."""
+        return self._retry_deadlock(self._insert_graph_points_once, match_id, data)
+
+    def _insert_graph_points_once(self, match_id: int, data: dict):
         if not data or not isinstance(data, dict):
             return 0
         points = data.get("graphPoints", [])
@@ -1875,6 +1974,9 @@ class DataInserter:
 
     def insert_odds(self, match_id: int, data: dict):
         """Insert odds markets, one row per market choice."""
+        return self._retry_deadlock(self._insert_odds_once, match_id, data)
+
+    def _insert_odds_once(self, match_id: int, data: dict):
         if not data or not isinstance(data, dict):
             return 0
         markets = data.get("markets", [])

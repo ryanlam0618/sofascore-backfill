@@ -445,6 +445,11 @@ def ensure_team(mysql_conn, team_id: int, name: str, short_name: str = None, cou
     stadium = _first_non_empty(payload.get("venueName"), payload.get("stadium"), payload.get("venue", {}).get("name"), payload.get("ground", {}).get("name"))
     founded_year = _first_non_empty(payload.get("founded"), payload.get("foundedYear"), payload.get("foundationYear"))
     team_type = "national" if payload.get("national") is True else "club"
+    # Null-guard: teams.name is NOT NULL. _first_non_empty can return None when
+    # every candidate is empty/None (e.g. nested team object carries no name),
+    # which would raise IntegrityError 1048 'Column name cannot be null'.
+    name = _first_non_empty(name, short_name, payload.get("name"), "Unknown")
+    short_name = _first_non_empty(short_name, name, payload.get("shortName"))
     cur.execute(
         """INSERT INTO teams (team_id, name, short_name, slug, country_code, city, stadium, founded_year, team_type)
            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -487,6 +492,10 @@ def ensure_player(
     birth_date = _parse_date_value(_first_non_empty(payload.get("dateOfBirthTimestamp"), payload.get("birthDateTimestamp"), payload.get("dateOfBirth"), payload.get("birthDate")))
     preferred_foot = _normalize_preferred_foot(_first_non_empty(payload.get("preferredFoot"), payload.get("foot")))
     resolved_team_id = _first_non_empty(current_team_id, payload.get("team", {}).get("id"), payload.get("currentTeam", {}).get("id"), payload.get("teamId"))
+    # Null-guard: players.name is NOT NULL; never pass None (would raise
+    # IntegrityError 1048 'Column name cannot be null').
+    name = _first_non_empty(name, payload.get("name"), short_name, "Unknown")
+    short_name = _first_non_empty(short_name, name, payload.get("shortName"))
 
     cur.execute(
         """INSERT INTO players
@@ -1708,7 +1717,7 @@ class DataInserter:
                 ensure_team(
                     self.conn,
                     team_id,
-                    _first_non_empty(team_payload.get("name"), team.get("name", ""), ""),
+                    _first_non_empty(team_payload.get("name"), team.get("name"), "Unknown"),
                     _first_non_empty(team_payload.get("shortName"), team.get("shortName", "")),
                     team_payload.get("countryCode"),
                     team_payload,

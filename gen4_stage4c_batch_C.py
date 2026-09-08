@@ -393,13 +393,23 @@ def process_event(ctx, match_id, home_team_id, away_team_id, pacing_lock, ev_loc
 def main():
     import argparse
     global CONCURRENCY, PACING_S, MAX_RETRIES, COOLDOWN_S, EARLY_STOP_CONSECUTIVE_403
+    global POOL, REPORT_FILE, EVIDENCE_FILE
     parser = argparse.ArgumentParser()
     parser.add_argument("--concurrency", type=int, default=CONCURRENCY)
     parser.add_argument("--pacing", type=float, default=PACING_S)
     parser.add_argument("--retries", type=int, default=MAX_RETRIES)
     parser.add_argument("--cooldown", type=float, default=COOLDOWN_S)
     parser.add_argument("--early-stop", type=int, default=EARLY_STOP_CONSECUTIVE_403)
+    parser.add_argument("--season-labels", type=str, default="25/26",
+                        help="comma-separated seasons.year_label, e.g. '15/16,16/17'")
+    parser.add_argument("--pool-file", type=str, default=str(POOL_FILE))
+    parser.add_argument("--report-file", type=str, default=str(REPORT_FILE))
+    parser.add_argument("--evidence-file", type=str, default=str(EVIDENCE_FILE))
     args = parser.parse_args()
+    POOL = PoolRotator(Path(args.pool_file), args.cooldown)
+    REPORT_FILE = Path(args.report_file)
+    EVIDENCE_FILE = Path(args.evidence_file)
+    season_labels = [s.strip() for s in args.season_labels.split(",") if s.strip()]
     CONCURRENCY = args.concurrency
     PACING_S = args.pacing
     MAX_RETRIES = args.retries
@@ -423,19 +433,23 @@ def main():
     )
     cur = conn.cursor()
 
-    cur.execute("""
+    placeholders = ",".join(["%s"] * len(season_labels))
+    cur.execute(
+        f"""
         SELECT m.match_id, m.home_team_id, m.away_team_id
         FROM matches m
         JOIN seasons s ON m.season_id = s.season_id
-        WHERE s.year_label = '25/26'
+        WHERE s.year_label IN ({placeholders})
           AND m.status = 'finished'
           AND m.home_score IS NOT NULL
         ORDER BY m.match_id
-    """)
+    """,
+        season_labels,
+    )
     rows = cur.fetchall()
     conn.close()
 
-    print(f"[Stage4c Batch C] Candidate events: {len(rows)}", flush=True)
+    print(f"[Stage4c Batch C] season_labels={season_labels} Candidate events: {len(rows)}", flush=True)
     if not rows:
         print("[Stage4c Batch C] No events.", flush=True)
         return 0

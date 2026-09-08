@@ -17,7 +17,11 @@ This repo is organized around one practical goal: reliably enumerate competition
 
 The supported production path is intentionally small:
 
-### `backfill_runner.py` — the production backfill entry point
+### `run_backfill.py` — the production backfill entry point (since Stage 4d-3, 2026-09-08)
+
+`run_backfill.py` is the unified dispatcher. Production default engine is **Gen4 fp-v2 (chrome124 pin + fixed-IP pool)** since Kris's 2026-09-08 19:48 approval; rollback any run with `--engine gen2` or `BACKFILL_ENGINE=gen2`. See `docs/gen4_deployment_report_v1.md` (§4 rollback) and `docs/gen4_stage4d4_deploy_runbook.md`.
+
+Legacy direct entry: `backfill_runner.py` (Gen2 hybrid — unpinned `impersonate="chrome"` + rotate gateway).
 This is the browser-first -> normalized MySQL pipeline. The old modular fetch/orchestrator scripts are retained in Git history, but are not part of the supported v2 runtime.
 
 Flow:

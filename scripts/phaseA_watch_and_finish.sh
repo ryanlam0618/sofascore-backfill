@@ -21,4 +21,8 @@ $VENV gen4_stage4c_batch_C.py \
   --evidence-file data/gen4_phaseA_newendpoints_evidence.jsonl \
   >> "$LOGDIR/newendpoints.log" 2>&1
 
+echo "new-endpoints done $(date) — starting partial-write repair sweep (Kris opt (a) 02:14)" >> "$LOGDIR/watcher.log"
+$VENV gen4_phaseA_repair_sweep.py >> "$LOGDIR/repair_sweep.log" 2>&1
+echo "repair sweep done $(date)" >> "$LOGDIR/watcher.log"
+
 echo "PHASE_A_COMPLETE $(date)" >> "$LOGDIR/watcher.log"

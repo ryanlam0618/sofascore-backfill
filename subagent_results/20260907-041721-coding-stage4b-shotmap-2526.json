@@ -1,0 +1,60 @@
+{
+  "schema_version": "1.0",
+  "task_id": "20260907-041721-coding-stage4b-shotmap-2526",
+  "agent": "coding",
+  "status": "completed",
+  "created_at": "2026-09-06T20:17:21.540340+00:00",
+  "request_summary": "25/26 season shotmap backfill using new 33-IP pool (good_20260907.txt)",
+  "scope_completed": [
+    "Queried 5 25/26 season events missing shotmap across 15 competitions",
+    "Backfilled shotmap via curl_cffi chrome124 with 33-IP round-robin pool",
+    "Inserted 147 shotmap rows into match_shotmap table"
+  ],
+  "findings": [],
+  "actions_taken": [
+    "Processed 5 events",
+    "Inserted 147 shotmap rows",
+    "Used pool of 33 IPs with round-robin + cooldown"
+  ],
+  "verification": [
+    {
+      "check": "report_file_exists",
+      "result": "passed",
+      "evidence": "/root/.openclaw/workspace/sofascore-backfill/data/gen4_stage4b_shotmap_2526_report.json"
+    },
+    {
+      "check": "evidence_file_exists",
+      "result": "passed",
+      "evidence": "/root/.openclaw/workspace/sofascore-backfill/data/gen4_stage4b_shotmap_2526_evidence.jsonl"
+    },
+    {
+      "check": "rows_inserted",
+      "result": "passed",
+      "evidence": "147"
+    }
+  ],
+  "risks": [
+    "None"
+  ],
+  "blockers": [
+    "None"
+  ],
+  "recommended_next_actions": [
+    "Review report for per-comp pass rates",
+    "Consider expanding pool if transport_blocked rate high",
+    "Run verification on inserted rows"
+  ],
+  "handoff_to_main": "Stage 4b 25/26 shotmap backfill completed. Report at /root/.openclaw/workspace/sofascore-backfill/data/gen4_stage4b_shotmap_2526_report.json.",
+  "telegram_usage": {
+    "used": true,
+    "bot_name": "coding-bot",
+    "direction": "outbound",
+    "targets": [
+      "Kris"
+    ],
+    "inbound_summary": "Kris direct task 2026-09-07 04:12 GMT+8: 25/26 shotmap backfill with new good IP pool",
+    "outbound_reply_bot": "coding-bot",
+    "exception_handled_by_main": false,
+    "note": "Task completed, artifact written for Main Agent review"
+  }
+}

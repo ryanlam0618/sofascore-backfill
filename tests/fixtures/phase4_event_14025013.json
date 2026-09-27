@@ -1,0 +1,76 @@
+{
+  "event_id": 14025013,
+  "endpoint_event": {
+    "path": "/api/v1/event/14025013",
+    "event_id": 14025013,
+    "endpoint": "event",
+    "status": 200,
+    "ok": true,
+    "payload_complete": true,
+    "transport": "curl_cffi",
+    "attempts": [
+      {
+        "transport": "curl_cffi",
+        "status": 200,
+        "latency_ms": 1606,
+        "error": null
+      }
+    ],
+    "retry_count": 0,
+    "latency_ms": 1606,
+    "error": null,
+    "fallback_used": false,
+    "ssr_signals": null
+  },
+  "endpoint_incidents": {
+    "path": "/api/v1/event/14025013/incidents",
+    "event_id": 14025013,
+    "endpoint": "incidents",
+    "status": 0,
+    "ok": false,
+    "payload_complete": false,
+    "transport": "ssr",
+    "attempts": [
+      {
+        "transport": "curl_cffi",
+        "status": 403,
+        "latency_ms": 1619,
+        "error": null
+      },
+      {
+        "transport": "cloakbrowser",
+        "status": 403,
+        "latency_ms": 2675,
+        "error": null
+      },
+      {
+        "transport": "ssr",
+        "status": 0,
+        "latency_ms": 0,
+        "error": "ssr_returned_none"
+      }
+    ],
+    "retry_count": 0,
+    "latency_ms": 4295,
+    "error": null,
+    "fallback_used": true,
+    "ssr_signals": null
+  },
+  "summary": {
+    "n_total": 2,
+    "http_success_rate": 0.5,
+    "final_usable_success_rate": 0.5,
+    "payload_completeness_rate": 0.5,
+    "endpoint_coverage_rate": 0.5,
+    "n_200": 1,
+    "n_403": 0,
+    "n_404": 0,
+    "n_407": 0,
+    "p50_latency_ms": 4295,
+    "p90_latency_ms": 1606,
+    "fallback_attempt_count": 1,
+    "fallback_success_count": 0,
+    "epipe_count": 0
+  },
+  "frozen_at": "2026-08-25 08:10 GMT+8 (Phase 4 verdict)"
+}

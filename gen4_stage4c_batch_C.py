@@ -492,7 +492,7 @@ def main():
                 if k in ("ip_banned",):
                     any_403 = True
             for ep_name, n in ev.get("rows", {}).items():
-                total_rows += n
+                total_rows += (n or 0)
 
             if any_403:
                 consecutive_403 += 1

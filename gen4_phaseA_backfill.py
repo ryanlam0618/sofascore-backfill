@@ -35,9 +35,9 @@ import yaml
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 # Pool = 23-IP fresh slice, G-A live check 2026-09-09 00:5x GMT+8
-# (good_20260907.txt re-probed; 10 IPs 403/timeout removed; 23 kept).
+# Tranche v2 pool (Kris approved 2026-09-11 20:17 GMT+8): 21 verified GOOD IPs.
 POOL_FILES = [
-    ROOT / "data/proxy_pools/good_phaseA_20260909.txt",  # 23 IPs, verified at phase start
+    ROOT / "data/proxy_pools/good_20260917_v2.txt",  # 20 NEW IPs, verified 2026-09-17 (old 21 disabled by Kris)
 ]
 YAML_FILE = ROOT / "competitions_10y.yaml"
 _TAG = os.environ.get("PHASE_TAG", "all")
@@ -45,6 +45,7 @@ IDS_FILE = ROOT / "data/phaseA_event_ids.json"
 REPORT = ROOT / f"data/gen4_phaseA_report_{_TAG}.json"
 EV = Path(f"/tmp/gen4_phaseA/evidence_{_TAG}.jsonl")
 EV.parent.mkdir(exist_ok=True)
+HEALTH_AUDIT_DIR = Path(f"/tmp/gen4_phaseA/ip_health_{_TAG}")
 TIMEOUT = 20
 
 # Phase A target seasons (Kris green light 2026-09-09 00:36 GMT+8, oldest-first):
@@ -86,11 +87,19 @@ def load_pool():
 _pool = None
 _ctr = {"n": 0}
 
+# Health-score integration (Tranche v2 proxy policy). Disabled during --selftest
+# so offline tests produce zero audit/state side effects.
+import ip_health_score as _health
+HEALTH_ENABLED = False
+
 
 def next_ip():
     global _pool
     if _pool is None:
         _pool = load_pool()
+    if HEALTH_ENABLED:
+        # Health-aware selection: skip quarantined IPs; fallback to soonest-release.
+        return _health.pick_ip(_pool)
     m = _pool[_ctr["n"] % len(_pool)]
     _ctr["n"] += 1
     return m
@@ -133,19 +142,32 @@ def fetch_json(path, retries):
             r = HTTP_GET(path, proxy)
             if r.status_code == 200:
                 try:
+                    _record_health(m["ip"], "success", path)
                     return FetchResult("ok", body=r.json(), http=200, ip=m["ip"], tries=attempt)
                 except Exception as e:
                     last = {"http": 200, "ip": m["ip"], "error": f"invalid_json: {e}"[:120]}
             elif r.status_code == 404:
+                _record_health(m["ip"], "not_found", path, extra={"http": 404})
                 return FetchResult("no_data", http=404, ip=m["ip"], error="http_404", tries=attempt)
             else:
                 last = {"http": r.status_code, "ip": m["ip"],
                         "error": f"http_{r.status_code}"}
+                outcome = "403" if r.status_code == 403 else "fail"
+                _record_health(m["ip"], outcome, path, extra={"http": r.status_code})
         except Exception as e:
             last = {"http": None, "ip": m["ip"],
                     "error": f"{type(e).__name__}: {str(e)[:120]}"}
+            _record_health(m["ip"], "fail", path, extra={"error": type(e).__name__})
     return FetchResult("fail", http=last.get("http"), ip=last.get("ip"),
                        error=last.get("error"), tries=retries)
+
+
+def _record_health(ip, outcome, path, extra=None):
+    """No-op during selftest; otherwise feed the health scorer."""
+    if not HEALTH_ENABLED:
+        return
+    _health.record_outcome(ip, outcome, path=path, extra=extra,
+                           audit_dir=HEALTH_AUDIT_DIR)
 
 
 def tier(name):
@@ -686,6 +708,7 @@ def run_dryrun(n):
 
 
 def main(argv):
+    global HEALTH_ENABLED
     args = types.SimpleNamespace(
         ids_only="--ids-only" in argv,
         selftest="--selftest" in argv,
@@ -699,6 +722,8 @@ def main(argv):
         idx = argv.index("--dry-run")
         n = int(argv[idx + 1]) if idx + 1 < len(argv) and argv[idx + 1].isdigit() else 1
         return run_dryrun(n)
+    # Live path (ids-only / resume / default): enable health scoring.
+    HEALTH_ENABLED = True
     if args.ids_only:
         return run_ids_only(args)
     return run_live(args)

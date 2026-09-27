@@ -57,6 +57,75 @@ TARGET_ENDPOINTS = {
     "achievements":   "/api/v1/event/{eid}/achievements",
 }
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# Endpoint normalization — per plan §4.1
+# ════════════════════════════════════════════════════════════════════════════
+import re
+
+def _build_endpoint_patterns():
+    r"""Build (regex, endpoint_name) list from TARGET_ENDPOINTS.
+
+    Per Kris 08:56: caller (capture()) strips the /api/v1/ prefix,
+    query string, fragment, and trailing slash before passing the
+    bare tail to _normalize_endpoint_name(). The normalizer must
+    therefore compile regex patterns against the same shape —
+    i.e. from TARGET_ENDPOINTS entries with the /api/v1/ prefix
+    removed (no ordinary .replace() that could accidentally affect
+    mid-path content).
+
+    Use \d+ rather than (?P<eid>\d+) because the normalizer does not
+    need to extract the eid; it only needs to verify the path shape.
+    """
+    patterns = []
+    for name, path in TARGET_ENDPOINTS.items():
+        # Remove /api/v1/ prefix only (removeprefix avoids accidental
+        # mid-path substitution), then strip any leading slashes so the
+        # regex anchors cleanly with ^pattern$.
+        bare_path = path.removeprefix("/api/v1/").lstrip("/")
+        regex_src = re.escape(bare_path).replace(r"\{eid\}", r"\d+")
+        patterns.append((re.compile(rf"^{regex_src}$"), name))
+    return patterns
+
+_ENDPOINT_PATTERNS = _build_endpoint_patterns()
+
+
+def _normalize_endpoint_name(url_tail):
+    """Map URL tail (after /api/v1/) to canonical endpoint name.
+
+    Returns the bare endpoint name from TARGET_ENDPOINTS if the tail matches
+    a declared pattern after stripping a single trailing slash.
+
+    Returns None for any malformed / unknown URL tail — including empty
+    string, non-string input, query strings, fragments, uppercase variants,
+    non-numeric eid, and patterns not declared in TARGET_ENDPOINTS.
+
+    Per Blocking Condition #2: no silent fallback to 'unknown' or any
+    other string. Rejection is explicit. Never raises.
+    """
+    if not isinstance(url_tail, str) or not url_tail:
+        return None
+    # Strip single trailing slash (common in handcrafted URLs)
+    tail = url_tail.rstrip("/") if url_tail != "/" else ""
+    if not tail:
+        return None
+    # Reject query strings and fragments early
+    if "?" in tail or "#" in tail:
+        return None
+    # Reject any uppercase component (case-sensitive match)
+    if tail != tail.lower():
+        return None
+    for pattern, name in _ENDPOINT_PATTERNS:
+        if pattern.match(tail):
+            return name
+    return None
+
+
+class EndpointNormalizationError(Exception):
+    """Reserved for callers that prefer explicit raising over None handling."""
+    pass
+
+
 # Retry config
 MAX_IP_RETRIES = 5          # Max browser relaunches per event (each gets new IP)
 PAGE_TIMEOUT_MS = 45000     # Event page load timeout (proxy is slow)

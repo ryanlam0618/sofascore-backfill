@@ -2002,6 +2002,9 @@ class DataInserter:
                             structure_type, suspended, choice_name, initial_fractional_value,
                             fractional_value, winning)
                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                       ON DUPLICATE KEY UPDATE
+                           fractional_value = VALUES(fractional_value),
+                           winning = VALUES(winning)
                     """,
                     (match_id, market.get("marketId"), market.get("marketName"), market.get("marketGroup"),
                      market.get("marketPeriod"), market.get("structureType"), 1 if market.get("suspended") else 0,

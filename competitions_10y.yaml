@@ -1,193 +1,186 @@
-# SofaScore 10-Year Backfill — Competition Configuration
-# Generated: 2026-05-04, Updated: 2026-05-08
-#
-# Status values:
-#   discovered  - seasons discovered via discover_seasons.py
-#   confirmed  - PL only, season IDs verified with live API
-#   blocked    - ut_id unknown, cannot discover
-#
-# Season discovery: python3 discover_seasons.py --all
-
 competitions:
-  # ── Top 5 European Leagues ────────────────────────────────────────────────
-  - name: Premier League
-    category_id: 1
-    ut_id: 17
-    cat_country: England
-    season_mode: national
-    season_id_2024_25: 61627
-    season_id_2025_26: null
-    status: confirmed
-    notes: "381 events per season, rate-limited ~1req/s"
-
-  - name: La Liga
-    category_id: 32
-    ut_id: 8
-    cat_country: Spain
-    season_mode: national
-    season_id_2024_25: null
-    status: discovered
-
-  - name: Serie A
-    category_id: 31
-    ut_id: 23
-    cat_country: Italy
-    season_mode: national
-    season_id_2024_25: null
-    status: discovered
-
-  - name: Bundesliga
-    category_id: 30
-    ut_id: 35
-    cat_country: Germany
-    season_mode: national
-    season_id_2024_25: null
-    status: discovered
-    notes: "ut_id corrected 2026-07-02: 9 is Challenger Pro League (Belgium), 35 is Bundesliga (Germany)"
-
-  - name: Ligue 1
-    category_id: 7
-    ut_id: 34
-    cat_country: France
-    season_mode: national
-    season_id_2024_25: null
-    status: discovered
-
-  # ── Asian Leagues ─────────────────────────────────────────────────────────
-  - name: J1 League
-    category_id: 52
-    ut_id: 196
-    cat_country: Japan
-    season_mode: national
-    status: discovered
-
-  - name: K League 1
-    category_id: 291
-    ut_id: 410
-    cat_country: South Korea
-    season_mode: national
-    status: discovered
-
-  - name: A-League Men
-    category_id: 34
-    ut_id: 136
-    cat_country: Australia
-    season_mode: national
-    status: discovered
-
-  - name: Chinese Super League
-    category_id: 99
-    ut_id: 649
-    cat_country: China
-    season_mode: national
-    status: discovered
-
-  # ── UEFA Competitions ─────────────────────────────────────────────────────
-  - name: UCL
-    category_id: 1465
-    ut_id: 7
-    cat_country: europe
-    season_mode: uefa
-    status: discovered
-    notes: "unique-tournament path required"
-
-  - name: UEL
-    category_id: 1465
-    ut_id: 679
-    cat_country: europe
-    season_mode: uefa
-    status: discovered
-
-  - name: UECL
-    category_id: 1465
-    ut_id: 17015
-    cat_country: europe
-    season_mode: uefa
-    status: discovered
-
-  - name: AFC Champions League
-    category_id: 1467
-    ut_id: 463
-    cat_country: asia
-    season_mode: international
-    status: discovered
-
-  - name: AFC Champions League Two
-    category_id: 1467
-    ut_id: 668
-    cat_country: asia
-    season_mode: international
-    status: discovered
-    notes: "Formerly AFC Cup, rebranded 2024-25"
-
-  # ── Domestic Cups ─────────────────────────────────────────────────────────
-  - name: FA Cup
-    category_id: 1
-    ut_id: 19
-    cat_country: England
-    season_mode: cup
-    status: discovered
-
-  - name: EFL Cup
-    category_id: 1
-    ut_id: 21
-    cat_country: England
-    season_mode: cup
-    status: discovered
-
-  - name: Copa del Rey
-    category_id: 32
-    ut_id: 329
-    cat_country: Spain
-    season_mode: cup
-    status: discovered
-
-  - name: Coppa Italia
-    category_id: 31
-    ut_id: 328
-    cat_country: Italy
-    season_mode: cup
-    status: discovered
-
-  - name: Coupe de France
-    category_id: 7
-    ut_id: 335
-    cat_country: France
-    season_mode: cup
-    status: discovered
-
-  - name: DFB Pokal
-    category_id: 30
-    ut_id: 217
-    cat_country: Germany
-    season_mode: cup
-    status: discovered
-
-  - name: J.League Cup
-    category_id: 52
-    ut_id: 101
-    cat_country: Japan
-    season_mode: cup
-    status: discovered
-
-  - name: Emperor's Cup
-    category_id: 52
-    ut_id: 323
-    cat_country: Japan
-    season_mode: cup
-    status: discovered
-
-  - name: Australia Cup
-    category_id: 34
-    ut_id: 1786
-    cat_country: Australia
-    season_mode: cup
-    status: discovered
-
-  - name: Chinese FA Cup
-    category_id: 99
-    ut_id: 882
-    cat_country: China
-    season_mode: cup
-    status: discovered
-    notes: "ut_id 882 confirmed via API 2026-07-01, name: CFA Cup"
+- name: Premier League
+  category_id: 1
+  ut_id: 17
+  cat_country: England
+  season_mode: national
+  season_id_2024_25: 61627
+  season_id_2025_26: null
+  status: confirmed
+  notes: 381 events per season, rate-limited ~1req/s
+- name: La Liga
+  category_id: 32
+  ut_id: 8
+  cat_country: Spain
+  season_mode: national
+  season_id_2024_25: null
+  status: discovered
+- name: Serie A
+  category_id: 31
+  ut_id: 23
+  cat_country: Italy
+  season_mode: national
+  season_id_2024_25: null
+  status: discovered
+- name: Bundesliga
+  category_id: 30
+  ut_id: 35
+  cat_country: Germany
+  season_mode: national
+  season_id_2024_25: null
+  status: discovered
+  notes: 'ut_id corrected 2026-07-02: 9 is Challenger Pro League (Belgium), 35 is Bundesliga (Germany)'
+- name: Ligue 1
+  category_id: 7
+  ut_id: 34
+  cat_country: France
+  season_mode: national
+  season_id_2024_25: null
+  status: discovered_25_26
+  season_id_2025_26: 77356
+- name: J1 League
+  category_id: 52
+  ut_id: 196
+  cat_country: Japan
+  season_mode: national
+  season_id_2025_26: 69871
+  status: discovered_25_26
+  notes: 'Kris URL ruling 2026-09-02: season 69871 (''J.League 2025'') = the complete 25/26-equivalent season (verified full
+    window 2025-02-14..2025-12-06). J.League then runs a special transitional half-season ''2026'' (87931, Feb-May 2026) and
+    starts European-style ''26/27'' (96370, Aug 2026-) — both OUT of 25/26 scope. Verified via /unique-tournament/196/seasons
+    + events/last pagination.'
+- name: K League 1
+  category_id: 291
+  ut_id: 410
+  cat_country: South Korea
+  season_mode: national
+  status: discovered_25_26
+  season_id_2025_26: 88606
+  notes: calendar-year label '2026' (no 25/26 label); Q1=C fallback
+- name: A-League Men
+  category_id: 34
+  ut_id: 136
+  cat_country: Australia
+  season_mode: national
+  status: discovered_25_26
+  season_id_2025_26: 82603
+- name: Chinese Super League
+  category_id: 99
+  ut_id: 649
+  cat_country: China
+  season_mode: national
+  status: discovered_25_26
+  season_id_2025_26: 90049
+  notes: calendar-year label '2026' (no 25/26 label); Q1=C fallback
+- name: UCL
+  category_id: 1465
+  ut_id: 7
+  cat_country: europe
+  season_mode: uefa
+  status: discovered_25_26
+  notes: unique-tournament path required; season_id_2025_26=76953 discovered via /unique-tournament/7/seasons + smoke /events/last/0
+    (2026-09-06 Kris task, Forge execute)
+  season_id_2025_26: 76953
+- name: UEL
+  category_id: 1465
+  ut_id: 679
+  cat_country: europe
+  season_mode: uefa
+  status: discovered_25_26
+  season_id_2025_26: 76984
+- name: UECL
+  category_id: 1465
+  ut_id: 17015
+  cat_country: europe
+  season_mode: uefa
+  status: discovered_25_26
+  season_id_2025_26: 76960
+- name: AFC Champions League
+  category_id: 1467
+  ut_id: 463
+  cat_country: asia
+  season_mode: international
+  status: discovered_25_26
+  season_id_2025_26: 77010
+- name: AFC Champions League Two
+  category_id: 1467
+  ut_id: 668
+  cat_country: asia
+  season_mode: international
+  status: discovered_25_26
+  notes: Formerly AFC Cup, rebranded 2024-25
+  season_id_2025_26: 77009
+- name: FA Cup
+  category_id: 1
+  ut_id: 19
+  cat_country: England
+  season_mode: cup
+  status: discovered_25_26
+  season_id_2025_26: 82557
+- name: EFL Cup
+  category_id: 1
+  ut_id: 21
+  cat_country: England
+  season_mode: cup
+  status: discovered_25_26
+  season_id_2025_26: 77500
+- name: Copa del Rey
+  category_id: 32
+  ut_id: 329
+  cat_country: Spain
+  season_mode: cup
+  status: discovered_25_26
+  season_id_2025_26: 82988
+- name: Coppa Italia
+  category_id: 31
+  ut_id: 328
+  cat_country: Italy
+  season_mode: cup
+  status: discovered_25_26
+  season_id_2025_26: 77308
+- name: Coupe de France
+  category_id: 7
+  ut_id: 335
+  cat_country: France
+  season_mode: cup
+  status: discovered_25_26
+  season_id_2025_26: 85565
+- name: DFB Pokal
+  category_id: 30
+  ut_id: 217
+  cat_country: Germany
+  season_mode: cup
+  status: discovered_25_26
+  season_id_2025_26: 76910
+- name: J.League Cup
+  category_id: 52
+  ut_id: 101
+  cat_country: Japan
+  season_mode: cup
+  status: discovered_25_26
+  season_id_2025_26: 97720
+  notes: calendar-year label '2026' (no 25/26 label); Q1=C fallback
+- name: Emperor's Cup
+  category_id: 52
+  ut_id: 323
+  cat_country: Japan
+  season_mode: cup
+  status: discovered_25_26
+  season_id_2025_26: 96180
+  notes: calendar-year label '2026' (no 25/26 label); Q1=C fallback
+- name: Australia Cup
+  category_id: 34
+  ut_id: 1786
+  cat_country: Australia
+  season_mode: cup
+  status: discovered_25_26
+  season_id_2025_26: 97074
+  notes: calendar-year label '2026' (no 25/26 label); Q1=C fallback
+- name: Chinese FA Cup
+  category_id: 99
+  ut_id: 882
+  cat_country: China
+  season_mode: cup
+  status: discovered_25_26
+  season_id_2025_26: 91152
+  notes: 'ut_id 882 confirmed via API 2026-07-01, name: CFA Cup; calendar-year label 2026 (Q1=C fallback)'

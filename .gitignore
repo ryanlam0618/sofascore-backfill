@@ -38,3 +38,4 @@ proxy_list.txt
 .vscode/
 .idea/
 *.db
+data/proxy_audit/

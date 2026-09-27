@@ -39,3 +39,9 @@ proxy_list.txt
 .idea/
 *.db
 data/proxy_audit/
+
+# Scratch / recovery copies (ignore any variant)
+*.backup
+*.bak-*
+*.bak.*
+.env.bak*

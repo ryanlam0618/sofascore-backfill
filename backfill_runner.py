@@ -33,7 +33,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
-from team_attribution import resolve_side_team_id
+from team_attribution import resolve_incident_team_id, resolve_side_team_id
 from urllib.parse import urlparse
 
 
@@ -1592,11 +1592,19 @@ class DataInserter:
                 if not away_team.get("id"):
                     away_team = {"id": row[1]}
         count = 0
+        # team_id attribution guard (2026-10-03 follow-up, Kris-approved
+        # 17:34 HKT): route team resolution through team_attribution so a
+        # payload nested team.id that belongs to NEITHER match team
+        # (cross-match contamination class — the 10,486 rows deleted DB-side
+        # 2026-10-02) is skipped + counted instead of written.
+        rejected_foreign_team = 0
+        rejected_foreign_sample = []
+        skipped_no_side = 0
+        event_ctx = {"homeTeam": home_team, "awayTeam": away_team}
         for inc in incidents:
             inc_id = inc.get("id")
             if not inc_id:
                 continue
-            team = inc.get("team", {})
             player = inc.get("player") or inc.get("playerIn") or {}
             related_player = inc.get("relatedPlayer") or inc.get("playerOut") or {}
             assist_player = inc.get("assist") or {}
@@ -1637,20 +1645,24 @@ class DataInserter:
                 ct_map = {"yellow": "yellow", "red": "red", "yellowRed": "yellow_red"}
                 card_type = ct_map.get(inc_class)
 
-            team_id = team.get("id") if team else None
-
-            # SofaScore incidents don't have a nested "team" object; they use
-            # "isHome" to indicate which side the incident belongs to.
+            # SofaScore incidents normally carry no nested "team" object; the
+            # side comes from "isHome" → the match's home/away team id. A
+            # payload team.id is accepted only as a cross-check: a third team
+            # → skip + count (rejected_foreign_team).
+            team_id, reject_reason = resolve_incident_team_id(inc, event_ctx)
+            if reject_reason == "foreign_team_id":
+                rejected_foreign_team += 1
+                if len(rejected_foreign_sample) < 5:
+                    rejected_foreign_sample.append(inc_id)
+                continue
             if team_id is None:
-                if inc.get("isHome") is True:
-                    team_id = home_team.get("id")
-                elif inc.get("isHome") is False:
-                    team_id = away_team.get("id")
-
-            # Period markers, injuryTime, and other system rows may have no
-            # team at all. The current schema requires team_id NOT NULL, so
-            # skip those.
-            if team_id is None:
+                # Period markers, injuryTime, and other system rows may have
+                # no team at all. The current schema requires team_id NOT
+                # NULL, so skip those (documented decision, 2026-10-02 DB
+                # repair). Any NON-system row that still lacks a side signal
+                # is counted so silent data loss stays visible.
+                if inc.get("incidentType") not in ("period", "injuryTime"):
+                    skipped_no_side += 1
                 continue
 
             is_home = 1 if team_id == home_team.get("id") else 0
@@ -1681,6 +1693,10 @@ class DataInserter:
                  is_home, goal_type, card_type, inc.get("text"), inc.get("reason")),
             )
             count += 1
+        if rejected_foreign_team or skipped_no_side:
+            print('    [team_attribution] rejected %d foreign-team incident rows '
+                  '(sample ids: %s); skipped %d rows without a side signal'
+                  % (rejected_foreign_team, rejected_foreign_sample, skipped_no_side))
         self.conn.commit()
         return count
 

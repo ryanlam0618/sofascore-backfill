@@ -32,6 +32,12 @@ Verifies, against the REAL fixture match_14023966_full.json
   5. Behaviour       — the real gen4 upsert_lineups loop writes only 41/38
                        team ids on the fixture (40 rows, none of the garbage
                        player-level values).
+  6. Production guard — the REAL DataInserter.insert_incidents (the
+                       production path, backfill_runner.py) routes through
+                       team_attribution on the fixture: side-derived ids,
+                       synthetic foreign team.id row skipped + counted +
+                       logged, side-less period row skipped, non-system
+                       side-less row skipped + counted.
 
 Offline — no network, no MySQL. The insert paths are exercised against a
 recording fake cursor (same pattern as test_gen4_stage4d_insert_player_stats).
@@ -316,6 +322,65 @@ def test_backfill_runner_player_stats_get_event_team_ids(payload, ev):
         # values dict order: match_id, team_id, player_id, is_home, ...
         assert (params[1] == HOME_ID) == (params[3] == 1)
         assert params[1] in (HOME_ID, AWAY_ID)
+
+
+# ── 6. Production path: DataInserter.insert_incidents foreign-team guard ──────────────────────────────
+
+FOREIGN_INCIDENT_ROW = {
+    "id": 900001, "incidentType": "goal", "isHome": True, "time": 30,
+    "player": {"id": 111}, "team": {"id": 241802, "name": "RB Omima Ardija"},
+}
+SIDELESS_PERIOD_ROW = {
+    "id": 900004, "incidentType": "period", "text": "HT",
+    "time": 45, "addedTime": 999,
+}
+SIDELESS_NON_SYSTEM_ROW = {
+    "id": 900003, "incidentType": "varDecision", "time": 50,
+}
+
+
+def test_backfill_runner_insert_incidents_guard(payload, ev, capsys):
+    """Production path: DataInserter.insert_incidents routes team resolution
+    through team_attribution — (a) real fixture rows get side-derived ids,
+    (b) a synthetic third-team team.id row is skipped + counted + logged,
+    (c) a side-less period row is skipped (documented system-row decision),
+    and a non-system side-less row is skipped + counted."""
+    import backfill_runner
+
+    data = copy.deepcopy(payload["incidents"])
+    data["incidents"] = (list(data["incidents"])
+                        + [copy.deepcopy(FOREIGN_INCIDENT_ROW),
+                           copy.deepcopy(SIDELESS_PERIOD_ROW),
+                           copy.deepcopy(SIDELESS_NON_SYSTEM_ROW)])
+    # Mirror the real call path: _upsert_endpoint / replay_bundle inject the
+    # event's homeTeam/awayTeam into the incidents body before insert.
+    data["homeTeam"] = ev["homeTeam"]
+    data["awayTeam"] = ev["awayTeam"]
+
+    conn = _FakeConn()
+    inserter = backfill_runner.DataInserter(conn)
+    n = inserter.insert_incidents(14023966, data)
+
+    written = _inserts_like(conn.calls, "INSERT INTO match_incidents")
+    # (a) 20 attributable fixture rows — fixture period/injuryTime rows have
+    # no incident id and are skipped by the early guard; the synthetic
+    # period row (id present) is skipped at team resolution.
+    assert n == 20
+    assert len(written) == 20
+    for sql, params in written:
+        # (incident_id, match_id, team_id, player_id, related_player_id,
+        #  assist_player_id, incident_type, minute, added_time, period,
+        #  is_home, goal_type, card_type, incident_text, reason)
+        team_id, is_home = params[2], params[10]
+        assert team_id in (HOME_ID, AWAY_ID)
+        assert (team_id == HOME_ID) == (is_home == 1)
+        assert params[0] not in (900001, 900003, 900004)
+    # (b) + (c): guard counters + sample-id logging
+    out = capsys.readouterr().out
+    assert "rejected 1 foreign-team incident rows" in out
+    assert "900001" in out
+    # the non-system side-less row is counted; the period row is not
+    assert "skipped 1 rows without a side signal" in out
 
 
 # ── 5. helper gate ────────────────────────────────────────────────────────────

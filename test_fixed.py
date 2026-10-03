@@ -17,7 +17,11 @@ load_dotenv('.env')
 from curl_cffi import requests as cffi_requests
 
 async def test_all():
-    proxy = {'ip': '179.198.16.221', 'port': '6840', 'user': '***REMOVED***', 'pw': '***REMOVED***'}
+    # credentials come from the environment (never hardcoded):
+    #   PROXY_USER / PROXY_PW  (export them, e.g. via .env)
+    proxy = {'ip': '179.198.16.221', 'port': '6840',
+             'user': __import__('os').environ.get('PROXY_USER', ''),
+             'pw': __import__('os').environ.get('PROXY_PW', '')}
     proxy_url = 'http://{}:{}@{}:{}'.format(proxy["user"], proxy["pw"], proxy["ip"], proxy["port"])
     
     endpoints = {

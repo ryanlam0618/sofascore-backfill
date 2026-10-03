@@ -23,6 +23,19 @@ RULE (Kris-approved 2026-10-03 — applies to ALL loaders):
   loader MUST refuse to write a team_id that is not one of the match's two
   teams.
 
+SYSTEM MARKER CONVENTION (Kris 2026-10-03 18:07):
+  Side-less system marker rows (``incidentType`` in ("period", "injuryTime")
+  — HT/FT score markers, stoppage lengths) carry no isHome and no team, but
+  they are meaningful data and MUST be written. ``match_incidents.team_id``
+  is NOT NULL with an FK to ``teams``, so markers are written with the HOME
+  team id as a purely INERT FILLER (is_home = 0) and counted separately in
+  the loader's ``system_marker_rows`` counter — they are NOT attributions.
+  Consumers filter them via
+  ``v_match_incidents_fixed.attribution_status = 'period_marker'``
+  (team_id_fixed = NULL); this matches the 133,432 legacy period rows
+  already in appdb. Loader rows without a payload incident id use the
+  established synthetic id convention ``match_id * 1000 + idx``.
+
 Canonical lineups pattern:    gen4_lineups_replay.py:85-100
 Reference incidents impl:     backfill_runner.py:1655 (``insert_incidents`` —
                               isHome-derived; side-less system rows skipped)
@@ -41,6 +54,11 @@ from __future__ import annotations
 REASON_MISSING_TEAM_ID = "missing_team_id"   # no team id could be resolved
 REASON_FOREIGN_TEAM_ID = "foreign_team_id"   # id belongs to neither team
 REASON_NO_SIDE_SIGNAL = "no_side_signal"     # no isHome flag / usable team.id
+REASON_SYSTEM_MARKER = "system_marker"       # side-less marker row (see below)
+
+# SofaScore system marker rows: HT/FT period markers and injuryTime
+# stoppage-length markers. By design they carry NO side signal.
+SYSTEM_MARKER_TYPES = ("period", "injuryTime")
 
 
 def validate_team_id(team_id, home_id, away_id):
@@ -81,7 +99,28 @@ def resolve_side_team_id(event, is_home):
     return side.get("id")
 
 
-def resolve_incident_team_id(inc, event):
+def is_system_marker(inc):
+    """True when the incident is a side-less system marker row
+    (``incidentType`` 'period' or 'injuryTime')."""
+    return inc.get("incidentType") in SYSTEM_MARKER_TYPES
+
+
+def system_marker_team_id(event):
+    """Inert-filler team id for system marker rows (Kris 2026-10-03 18:07).
+
+    Marker rows (HT/FT period markers, injuryTime stoppage lengths) have NO
+    side signal — they belong to neither team. ``match_incidents.team_id`` is
+    NOT NULL with an FK to ``teams``, so the loader writes the HOME team id
+    as a purely inert filler with ``is_home = 0`` and counts the row in
+    ``system_marker_rows``. Consumers MUST filter these rows via
+    ``v_match_incidents_fixed.attribution_status = 'period_marker'``
+    (team_id_fixed = NULL); this matches the 133,432 legacy period rows
+    already in appdb.
+    """
+    return resolve_side_team_id(event, True)
+
+
+def resolve_incident_team_id(inc, event, allow_system_marker=True):
     """Authoritative team id for an incident row (L2).
 
     The side is derived from the trustworthy ``inc["isHome"]`` flag → the
@@ -93,12 +132,24 @@ def resolve_incident_team_id(inc, event):
 
     Returns ``(team_id, reject_reason)``:
       ``(team_id, None)``             — write the row with this team_id
+                                        (side-derived, or cross-checked payload
+                                        team.id)
+      ``(home_id, "system_marker")``  — Kris 2026-10-03 18:07 convention: a
+                                        side-less system marker row (period /
+                                        injuryTime). WRITE the row with this
+                                        team id as INERT FILLER (NOT NULL FK)
+                                        and ``is_home = 0`` from the payload
+                                        flag when present; count it in the
+                                        caller's ``system_marker_rows`` — it
+                                        is NOT an attribution. Consumers
+                                        filter via
+                                        ``v_match_incidents_fixed.attribution_status
+                                        = 'period_marker'`` (matches the
+                                        133,432 legacy period rows).
       ``(None, "foreign_team_id")``   — SKIP + count: payload team.id is a
                                         third team (cross-match contamination)
-      ``(None, "no_side_signal")``    — SKIP: no isHome flag and no payload
-                                        team.id (period / injuryTime system
-                                        rows land here; the reference
-                                        implementation skips them too)
+      ``(None, "no_side_signal")``    — SKIP: non-system row with no isHome
+                                        flag and no payload team.id
       ``(None, "missing_team_id")``    — SKIP: side resolved but the event
                                         payload lacks that side's team id
     """
@@ -120,6 +171,13 @@ def resolve_incident_team_id(inc, event):
         # when it already passed the cross-check above, i.e. it names one
         # of the match's two teams.
         if payload_team_id is None:
+            # Side-less system marker rows (period / injuryTime): Kris
+            # 2026-10-03 18:07 — write them with the home team id as inert
+            # filler (is_home = 0), counted separately by the caller.
+            if allow_system_marker and is_system_marker(inc):
+                marker_id = system_marker_team_id(event)
+                if marker_id is not None:
+                    return marker_id, REASON_SYSTEM_MARKER
             return None, REASON_NO_SIDE_SIGNAL
         team_id = payload_team_id
 

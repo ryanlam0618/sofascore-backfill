@@ -33,7 +33,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
-from team_attribution import resolve_incident_team_id, resolve_side_team_id
+from team_attribution import is_system_marker, resolve_incident_team_id, resolve_side_team_id
 from urllib.parse import urlparse
 
 
@@ -1600,11 +1600,22 @@ class DataInserter:
         rejected_foreign_team = 0
         rejected_foreign_sample = []
         skipped_no_side = 0
+        # Kris 2026-10-03 18:07: period/injuryTime system marker rows are
+        # written again (home team id as inert filler, is_home=0) and counted
+        # separately in system_marker_rows — they are NOT attributions.
+        system_marker_rows = 0
         event_ctx = {"homeTeam": home_team, "awayTeam": away_team}
-        for inc in incidents:
+        for idx, inc in enumerate(incidents):
             inc_id = inc.get("id")
             if not inc_id:
-                continue
+                # System marker rows carry no incident id in the payload but
+                # MUST be written (Kris 2026-10-03 18:07): synthesize the same
+                # id the gen4 loaders use (match_id * 1000 + idx) so both
+                # loader families write identical ids (idempotent re-runs).
+                # All other id-less rows keep the historical skip.
+                if not is_system_marker(inc):
+                    continue
+                inc_id = match_id * 1000 + idx
             player = inc.get("player") or inc.get("playerIn") or {}
             related_player = inc.get("relatedPlayer") or inc.get("playerOut") or {}
             assist_player = inc.get("assist") or {}
@@ -1616,6 +1627,11 @@ class DataInserter:
                 "substitution": "substitution",
                 "period": "period",
                 "varDecision": "var",
+                # injuryTime markers are side-less system rows: store them as
+                # 'period' like the gen4 loaders do (incident_type enum has no
+                # 'injuryTime' value; consumers filter via
+                # attribution_status='period_marker').
+                "injuryTime": "period",
             }
             mapped_type = type_map.get(inc_type, "goal")
             if mapped_type not in ("goal", "card", "substitution", "period", "var"):
@@ -1656,16 +1672,22 @@ class DataInserter:
                     rejected_foreign_sample.append(inc_id)
                 continue
             if team_id is None:
-                # Period markers, injuryTime, and other system rows may have
-                # no team at all. The current schema requires team_id NOT
-                # NULL, so skip those (documented decision, 2026-10-02 DB
-                # repair). Any NON-system row that still lacks a side signal
-                # is counted so silent data loss stays visible.
-                if inc.get("incidentType") not in ("period", "injuryTime"):
-                    skipped_no_side += 1
+                # Non-system rows that still lack a side signal are skipped +
+                # counted so silent data loss stays visible. (System markers
+                # come back with reason "system_marker" instead.)
+                skipped_no_side += 1
                 continue
 
-            is_home = 1 if team_id == home_team.get("id") else 0
+            if reject_reason == "system_marker":
+                # Inert filler: the home team id only satisfies the NOT NULL
+                # FK constraint — marker rows are NOT team attributions.
+                # Consumers filter them via
+                # v_match_incidents_fixed.attribution_status='period_marker';
+                # matches the 133,432 legacy period rows.
+                system_marker_rows += 1
+                is_home = 1 if inc.get("isHome") else 0
+            else:
+                is_home = 1 if team_id == home_team.get("id") else 0
 
             for person in (player, related_player, assist_player):
                 if person.get("id"):
@@ -1693,10 +1715,12 @@ class DataInserter:
                  is_home, goal_type, card_type, inc.get("text"), inc.get("reason")),
             )
             count += 1
-        if rejected_foreign_team or skipped_no_side:
+        if rejected_foreign_team or skipped_no_side or system_marker_rows:
             print('    [team_attribution] rejected %d foreign-team incident rows '
-                  '(sample ids: %s); skipped %d rows without a side signal'
-                  % (rejected_foreign_team, rejected_foreign_sample, skipped_no_side))
+                  '(sample ids: %s); skipped %d rows without a side signal; '
+                  '%d system marker rows written (inert home-team filler)'
+                  % (rejected_foreign_team, rejected_foreign_sample, skipped_no_side,
+                     system_marker_rows))
         self.conn.commit()
         return count
 

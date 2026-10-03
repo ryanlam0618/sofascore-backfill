@@ -486,8 +486,12 @@ def upsert_match_with_fk_seed(conn, event_data: dict, season_id: int, competitio
 def upsert_incidents(conn, match_id: int, data: dict, event_data: dict) -> int:
     # team_id attribution fix (2026-10-03): isHome-derived side ids only;
     # foreign-team rows are skipped + counted (rootcause_teamid_20261002.md).
+    # Kris 2026-10-03 18:07: period/injuryTime system marker rows are written
+    # with the home team id as inert filler (is_home=0) and counted separately
+    # in system_marker_rows — they are NOT attributions (team_attribution.py).
     rejected_foreign_team = 0
     rejected_foreign_sample = []
+    system_marker_rows = 0
     cur = conn.cursor()
     n = 0
     incidents = data.get("incidents", [])
@@ -499,6 +503,11 @@ def upsert_incidents(conn, match_id: int, data: dict, event_data: dict) -> int:
                 rejected_foreign_sample.append(inc.get("id"))
         if team_id is None:
             continue
+        if reject_reason == "system_marker":
+            # Inert filler: the home team id only satisfies the NOT NULL FK;
+            # NOT an attribution — consumers filter via
+            # v_match_incidents_fixed.attribution_status='period_marker'.
+            system_marker_rows += 1
         itype = inc.get("incidentType", "")
         if itype not in ("goal", "card", "substitution", "period", "var"):
             itype = "period"
@@ -550,9 +559,10 @@ def upsert_incidents(conn, match_id: int, data: dict, event_data: dict) -> int:
         except Exception as e:
             print('    Error inserting incident %s: %s' % (inc.get("id"), e))
             conn.rollback()
-    if rejected_foreign_team:
-        print('    [team_attribution] rejected %d foreign-team incident rows (sample ids: %s)'
-              % (rejected_foreign_team, rejected_foreign_sample))
+    if rejected_foreign_team or system_marker_rows:
+        print('    [team_attribution] rejected %d foreign-team incident rows (sample ids: %s); '
+              '%d system marker rows written (inert home-team filler)'
+              % (rejected_foreign_team, rejected_foreign_sample, system_marker_rows))
     conn.commit()
     return n
 

@@ -19,8 +19,10 @@ Verifies, against the REAL fixture match_14023966_full.json
                        value AND swapping the event ids to synthetic values —
                        resolution must follow the event ids alone.
   2. L2 incidents    — team_id derives from inc["isHome"] → event home/away.
-                       Side-less system rows (period / injuryTime) are skipped
-                       (reference behaviour, backfill_runner.py:1655).
+                       Side-less system marker rows (period / injuryTime) are
+                       WRITTEN with the home team id as inert filler, is_home=0,
+                       counted in system_marker_rows (Kris 2026-10-03 18:07);
+                       foreign third-team rows are skipped + counted.
   3. L2 foreign rows — a synthetic nested team.id belonging to a THIRD team is
                        rejected + counted: the real gen4 loader loop
                        (gen4_phaseB_cdf_gapfill.upsert_incidents) skips it,
@@ -185,7 +187,7 @@ def test_side_team_id_none_when_event_lacks_side(ev):
 # ── 2. L2: incidents derive from isHome ───────────────────────────────────────
 
 def test_incidents_derive_from_is_home(payload, ev):
-    attributable = skipped = 0
+    attributable = markers = 0
     for inc in payload["incidents"]["incidents"]:
         team_id, reason = resolve_incident_team_id(inc, ev)
         if inc.get("isHome") is True:
@@ -195,14 +197,42 @@ def test_incidents_derive_from_is_home(payload, ev):
             assert team_id == AWAY_ID and reason is None
             attributable += 1
         else:
-            # period / injuryTime system rows: no team semantics → skipped
-            # (reference behaviour, backfill_runner.py:1655; the 2026-10-02
-            # DB repair exposes them with team_id_fixed = NULL via view).
-            assert team_id is None
-            assert reason == "no_side_signal"
+            # period / injuryTime system marker rows: written with the HOME
+            # team id as INERT FILLER + reason "system_marker" (Kris
+            # 2026-10-03 18:07). is_home stays 0 — they are NOT attributions.
+            assert team_id == HOME_ID
+            assert reason == "system_marker"
             assert inc.get("incidentType") in ("period", "injuryTime")
-            skipped += 1
-    assert attributable == 20 and skipped == 4
+            markers += 1
+    assert attributable == 20 and markers == 4
+
+
+def test_system_marker_convention(ev):
+    """Kris 2026-10-03 18:07 marker convention, encapsulated in the helper.
+
+    period/injuryTime rows come back with the home team id (inert filler,
+    NOT an attribution) + reason "system_marker"; non-system side-less rows
+    still come back (None, 'no_side_signal'); allow_system_marker=False
+    restores the skip behaviour; marker rows that DO carry a valid payload
+    team.id or isHome use the normal attribution path.
+    """
+    import team_attribution as ta
+
+    period_row = {"incidentType": "period", "text": "FT", "time": 90, "addedTime": 999}
+    injury_row = {"incidentType": "injuryTime", "length": 4, "time": 90}
+    assert ta.resolve_incident_team_id(period_row, ev) == (HOME_ID, "system_marker")
+    assert ta.resolve_incident_team_id(injury_row, ev) == (HOME_ID, "system_marker")
+    assert ta.is_system_marker(period_row) and ta.is_system_marker(injury_row)
+    assert ta.system_marker_team_id(ev) == HOME_ID
+    # opt-out restores the skip behaviour
+    assert ta.resolve_incident_team_id(period_row, ev, allow_system_marker=False) \
+        == (None, "no_side_signal")
+    # non-system rows are never markers
+    assert ta.resolve_incident_team_id({"incidentType": "varDecision", "time": 50}, ev) \
+        == (None, "no_side_signal")
+    # a marker row that DOES carry a side flag uses the normal path
+    assert ta.resolve_incident_team_id({"incidentType": "period", "isHome": False}, ev) \
+        == (AWAY_ID, None)
 
 
 def test_incident_payload_team_id_used_only_as_crosscheck(ev):
@@ -240,7 +270,9 @@ def test_synthetic_foreign_team_row_rejected_and_counted_by_real_loader(
         payload, ev, capsys):
     """Run the REAL gen4 upsert_incidents loop (offline fake conn) on the
     fixture + 2 synthetic foreign rows: foreign rows skipped + counted,
-    never written; the rejected count + sample ids are logged."""
+    never written; the 4 fixture system marker rows are WRITTEN again with
+    the home-team inert filler (Kris 2026-10-03 18:07); rejected count +
+    marker count are logged."""
     import gen4_phaseB_cdf_gapfill as cdf
 
     data = copy.deepcopy(payload["incidents"])
@@ -249,10 +281,12 @@ def test_synthetic_foreign_team_row_rejected_and_counted_by_real_loader(
     n = cdf.upsert_incidents(conn, match_id=14023966, data=data, event_data=ev)
 
     written = _inserts_like(conn.calls, "INSERT INTO match_incidents")
-    # 20 attributable fixture rows only — 4 side-less rows skipped,
-    # 2 foreign rows rejected.
-    assert n == 20
-    assert len(written) == 20
+    # 20 attributable fixture rows + 4 system marker rows (FT, HT,
+    # injuryTime×2 — written again per Kris 2026-10-03 18:07); 2 foreign
+    # rows rejected; nothing else skipped.
+    assert n == 24
+    assert len(written) == 24
+    marker_rows = []
     for sql, params in written:
         # INSERT INTO match_incidents (match_id, incident_id, team_id, player_id,
         #                              incident_type, minute, added_time, period,
@@ -260,11 +294,22 @@ def test_synthetic_foreign_team_row_rejected_and_counted_by_real_loader(
         team_id = params[2]
         is_home = params[8]
         assert team_id in (HOME_ID, AWAY_ID)
-        assert (team_id == HOME_ID) == (is_home == 1)
         assert team_id not in {241802, 999}
+        if params[4] == "period":
+            # marker rows: home-team inert filler, is_home = 0 (both period
+            # and injuryTime are stored as 'period' by the gen4 mapping)
+            marker_rows.append(params)
+            assert team_id == HOME_ID and is_home == 0
+        else:
+            assert (team_id == HOME_ID) == (is_home == 1)
+    assert len(marker_rows) == 4
+    # id-less markers get the established synthetic ids (match_id*1000+idx)
+    for p in marker_rows:
+        assert p[1] // 1000 == 14023966
     out = capsys.readouterr().out
     assert "rejected 2 foreign-team incident rows" in out
     assert "900001" in out and "900002" in out
+    assert "4 system marker rows written" in out
 
 
 def test_real_loader_lineups_write_only_event_team_ids(payload, ev):
@@ -334,6 +379,9 @@ SIDELESS_PERIOD_ROW = {
     "id": 900004, "incidentType": "period", "text": "HT",
     "time": 45, "addedTime": 999,
 }
+SIDELESS_INJURYTIME_ROW = {
+    "id": 900005, "incidentType": "injuryTime", "length": 5, "time": 90,
+}
 SIDELESS_NON_SYSTEM_ROW = {
     "id": 900003, "incidentType": "varDecision", "time": 50,
 }
@@ -343,14 +391,17 @@ def test_backfill_runner_insert_incidents_guard(payload, ev, capsys):
     """Production path: DataInserter.insert_incidents routes team resolution
     through team_attribution — (a) real fixture rows get side-derived ids,
     (b) a synthetic third-team team.id row is skipped + counted + logged,
-    (c) a side-less period row is skipped (documented system-row decision),
-    and a non-system side-less row is skipped + counted."""
+    (c) side-less system marker rows (period, injuryTime) are WRITTEN with
+    the home-team inert filler + is_home=0 + counted in system_marker_rows
+    (Kris 2026-10-03 18:07), and a non-system side-less row is skipped +
+    counted."""
     import backfill_runner
 
     data = copy.deepcopy(payload["incidents"])
     data["incidents"] = (list(data["incidents"])
                         + [copy.deepcopy(FOREIGN_INCIDENT_ROW),
                            copy.deepcopy(SIDELESS_PERIOD_ROW),
+                           copy.deepcopy(SIDELESS_INJURYTIME_ROW),
                            copy.deepcopy(SIDELESS_NON_SYSTEM_ROW)])
     # Mirror the real call path: _upsert_endpoint / replay_bundle inject the
     # event's homeTeam/awayTeam into the incidents body before insert.
@@ -362,25 +413,40 @@ def test_backfill_runner_insert_incidents_guard(payload, ev, capsys):
     n = inserter.insert_incidents(14023966, data)
 
     written = _inserts_like(conn.calls, "INSERT INTO match_incidents")
-    # (a) 20 attributable fixture rows — fixture period/injuryTime rows have
-    # no incident id and are skipped by the early guard; the synthetic
-    # period row (id present) is skipped at team resolution.
-    assert n == 20
-    assert len(written) == 20
+    # (a) 20 attributable fixture rows + (c) 6 system marker rows: the 4
+    # id-less fixture markers (FT, HT, injuryTime×2 → synthetic ids
+    # match_id*1000+idx) plus the two synthetic marker rows (900004 period,
+    # 900005 injuryTime). 1 foreign row rejected; 1 non-system side-less
+    # row skipped + counted.
+    assert n == 26
+    assert len(written) == 26
+    marker_rows = []
     for sql, params in written:
         # (incident_id, match_id, team_id, player_id, related_player_id,
         #  assist_player_id, incident_type, minute, added_time, period,
         #  is_home, goal_type, card_type, incident_text, reason)
-        team_id, is_home = params[2], params[10]
+        team_id, is_home, inc_type = params[2], params[10], params[6]
         assert team_id in (HOME_ID, AWAY_ID)
-        assert (team_id == HOME_ID) == (is_home == 1)
-        assert params[0] not in (900001, 900003, 900004)
+        assert params[0] not in (900001, 900003)   # rejected / skipped rows
+        if inc_type == "period":
+            # marker rows: home-team inert filler, is_home = 0 (both period
+            # and injuryTime are stored as 'period' — the enum has no
+            # 'injuryTime' value)
+            marker_rows.append(params)
+            assert team_id == HOME_ID and is_home == 0
+        else:
+            assert (team_id == HOME_ID) == (is_home == 1)
+    assert len(marker_rows) == 6
+    # 4 fixture markers got synthetic ids; 900004 / 900005 kept theirs
+    synth = [p for p in marker_rows if p[0] // 1000 == 14023966]
+    assert len(synth) == 4
+    assert {p[0] for p in marker_rows if p[0] // 1000 != 14023966} == {900004, 900005}
     # (b) + (c): guard counters + sample-id logging
     out = capsys.readouterr().out
     assert "rejected 1 foreign-team incident rows" in out
     assert "900001" in out
-    # the non-system side-less row is counted; the period row is not
     assert "skipped 1 rows without a side signal" in out
+    assert "6 system marker rows written" in out
 
 
 # ── 5. helper gate ────────────────────────────────────────────────────────────

@@ -105,7 +105,8 @@ async def test_all():
         try:
             n = 0
             rejected_foreign_team = 0
-            for inc in bundle["incidents"]["incidents"]:
+            system_marker_rows = 0
+            for idx, inc in enumerate(bundle["incidents"]["incidents"]):
                 # team_id attribution fix (2026-10-03, Kris-approved): derive
                 # from the EVENT payload + isHome; skip + count foreign team
                 # ids (rootcause_teamid_20261002.md, team_attribution.py).
@@ -114,6 +115,10 @@ async def test_all():
                     rejected_foreign_team += 1
                 if team_id is None:
                     continue
+                if reject_reason == "system_marker":
+                    # Inert filler (NOT an attribution) — consumers filter via
+                    # v_match_incidents_fixed.attribution_status='period_marker'.
+                    system_marker_rows += 1
                 cur.execute("""
                     INSERT INTO match_incidents (match_id, incident_id, time, type, class, added_time,
                                                  home_score, away_score, player_id, player_name, team_id,
@@ -126,7 +131,13 @@ async def test_all():
                         team_id=VALUES(team_id), is_home=VALUES(is_home),
                         text=VALUES(text), in_game_minute=VALUES(in_game_minute)
                 """, (
-                    event_data.get("id"), inc.get("id"), inc.get("time"), inc.get("incidentType"),
+                    event_data.get("id"),
+                    inc.get("id") or ((event_data.get("id") or 0) * 1000 + idx),
+                    inc.get("time"),
+                    # injuryTime is a side-less system marker: store as 'period'
+                    # (incident_type enum has no 'injuryTime' value — matches
+                    # the gen4 loaders + attribution_status='period_marker').
+                    "period" if inc.get("incidentType") == "injuryTime" else inc.get("incidentType"),
                     inc.get("incidentClass"), inc.get("addedTime"),
                     inc.get("homeScore"), inc.get("awayScore"),
                     inc.get("player", {}).get("id"),
@@ -138,8 +149,10 @@ async def test_all():
                 n += 1
             conn.commit()
             print("\u2705 incidents: %s rows" % n)
-            if rejected_foreign_team:
-                print("    [team_attribution] rejected %d foreign-team incident rows" % rejected_foreign_team)
+            if rejected_foreign_team or system_marker_rows:
+                print("    [team_attribution] rejected %d foreign-team incident rows; "
+                      "%d system marker rows written (inert home-team filler)"
+                      % (rejected_foreign_team, system_marker_rows))
         except Exception as e:
             print("\u274c incidents: %s" % e)
             conn.rollback()

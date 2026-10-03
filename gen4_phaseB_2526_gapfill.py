@@ -40,6 +40,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
+from team_attribution import resolve_incident_team_id, resolve_side_team_id
 
 import mysql.connector
 from dotenv import load_dotenv
@@ -483,14 +484,19 @@ def upsert_match_with_fk_seed(conn, event_data: dict, season_id: int, competitio
 
 
 def upsert_incidents(conn, match_id: int, data: dict, event_data: dict) -> int:
-    fallback_team_id = (event_data.get("homeTeam") or {}).get("id") or (event_data.get("awayTeam") or {}).get("id")
+    # team_id attribution fix (2026-10-03): isHome-derived side ids only;
+    # foreign-team rows are skipped + counted (rootcause_teamid_20261002.md).
+    rejected_foreign_team = 0
+    rejected_foreign_sample = []
     cur = conn.cursor()
     n = 0
     incidents = data.get("incidents", [])
     for idx, inc in enumerate(incidents):
-        team_id = inc.get("team", {}).get("id")
-        if team_id is None:
-            team_id = fallback_team_id
+        team_id, reject_reason = resolve_incident_team_id(inc, event_data)
+        if reject_reason == "foreign_team_id":
+            rejected_foreign_team += 1
+            if len(rejected_foreign_sample) < 5:
+                rejected_foreign_sample.append(inc.get("id"))
         if team_id is None:
             continue
         itype = inc.get("incidentType", "")
@@ -544,8 +550,12 @@ def upsert_incidents(conn, match_id: int, data: dict, event_data: dict) -> int:
         except Exception as e:
             print('    Error inserting incident %s: %s' % (inc.get("id"), e))
             conn.rollback()
+    if rejected_foreign_team:
+        print('    [team_attribution] rejected %d foreign-team incident rows (sample ids: %s)'
+              % (rejected_foreign_team, rejected_foreign_sample))
     conn.commit()
     return n
+
 
 
 def upsert_lineups(conn, match_id: int, data: dict, event_data: dict) -> int:
@@ -557,12 +567,12 @@ def upsert_lineups(conn, match_id: int, data: dict, event_data: dict) -> int:
     for is_home, key in ((1, "home"), (0, "away")):
         side = data.get(key, {}) or {}
         team = side.get("team") or {}
-        team_id = team.get("id")
         players = side.get("players", []) or []
-        if team_id is None and players:
-            team_id = players[0].get("teamId")
-        if team_id is None:
-            team_id = (data["homeTeam"] if is_home else data["awayTeam"]).get("id")
+        # team_id attribution fix (2026-10-03, Kris-approved): derive from the
+        # EVENT payload (same ids the matches table stores) + the trusted
+        # is_home side flag — never from the garbage player-level `teamId`
+        # (rootcause_teamid_20261002.md, team_attribution.py).
+        team_id = resolve_side_team_id(event_data, is_home)
         fallback_team = data["homeTeam"] if is_home else data["awayTeam"]
 
         for p in players:

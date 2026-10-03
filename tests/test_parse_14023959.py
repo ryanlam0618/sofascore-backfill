@@ -45,6 +45,7 @@ conn.commit()
 
 # ── Match ──
 from backfill_runner import DataInserter
+from team_attribution import resolve_side_team_id
 inserter = DataInserter(conn)
 
 # Actually let's do everything manually to control the process
@@ -89,11 +90,10 @@ print(f'✅ Match inserted')
 for is_home, side in [(1, 'home'), (0, 'away')]:
     team_data = lineups.get(side, {})
     players = team_data.get('players', [])
-    team_id = None
-    if players:
-        team_id = players[0].get('teamId')
-    if team_id is None:
-        team_id = (ht if is_home else at).get('id')
+    # team_id attribution fix (2026-10-03, Kris-approved): event payload side
+    # id only — never the garbage player-level `teamId`
+    # (rootcause_teamid_20261002.md, team_attribution.py).
+    team_id = resolve_side_team_id(event_data, is_home)
 
     for entry in players:
         player = entry.get('player', {})

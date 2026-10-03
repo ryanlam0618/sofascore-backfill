@@ -28,6 +28,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+from team_attribution import resolve_side_team_id
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
@@ -239,12 +240,13 @@ def seed_from_bundle(conn, bundle: Dict[str, Any]) -> Dict[str, int]:
         inserted, team_id = seed_team(cur, side_team)
         counts["teams"] += inserted
         if team_id is None:
-            players = side.get("players") or []
-            if players:
-                team_id = players[0].get("teamId")
-                if team_id is not None:
-                    inserted, team_id = seed_team(cur, {"id": team_id, "name": "Unknown"})
-                    counts["teams"] += inserted
+            # team_id attribution fix (2026-10-03, Kris-approved): event
+            # payload side id only — never the garbage player-level `teamId`
+            # (rootcause_teamid_20261002.md, team_attribution.py).
+            team_id = resolve_side_team_id(event_data, side_key == "home")
+            if team_id is not None:
+                inserted, team_id = seed_team(cur, {"id": team_id, "name": "Unknown"})
+                counts["teams"] += inserted
         if team_id is not None:
             team_ids.add(team_id)
         for item in side.get("players", []) or []:

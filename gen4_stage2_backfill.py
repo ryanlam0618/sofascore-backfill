@@ -14,6 +14,7 @@ Safety:
  - Per-IP drift log in artifact.
 """
 from __future__ import annotations
+from team_attribution import resolve_side_team_id
 
 import json
 import os
@@ -73,12 +74,12 @@ def insert_match_lineups(conn, match_id, data, event):
     n = 0
     for is_home, key in ((1, "home"), (0, "away")):
         side = data.get(key, {}) or {}
-        team_id = (side.get("team") or {}).get("id")
         players = side.get("players", []) or []
-        if team_id is None and players:
-            team_id = players[0].get("teamId")
-        if team_id is None:
-            team_id = (data["homeTeam"] if is_home else data["awayTeam"]).get("id")
+        # team_id attribution fix (2026-10-03, Kris-approved): derive from the
+        # EVENT payload (same ids the matches table stores) + the trusted
+        # is_home side flag — never from the garbage player-level `teamId`
+        # (rootcause_teamid_20261002.md, team_attribution.py).
+        team_id = resolve_side_team_id(event, is_home)
         for p in players:
             pl = p.get("player", {})
             if not pl.get("id") or team_id is None:

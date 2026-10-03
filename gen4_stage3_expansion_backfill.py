@@ -26,6 +26,7 @@ Modes  : default live run (Kris launch approval required);
          --resume      skip event ids already present in matches table.
 """
 from __future__ import annotations
+from team_attribution import resolve_side_team_id
 
 import json
 import sys
@@ -169,12 +170,12 @@ def insert_match_lineups(conn, match_id, data, event):
     for is_home, key in ((1, "home"), (0, "away")):
         side = data.get(key, {}) or {}
         team = side.get("team") or {}
-        team_id = team.get("id")
         players = side.get("players", []) or []
-        if team_id is None and players:
-            team_id = players[0].get("teamId")
-        if team_id is None:
-            team_id = (data["homeTeam"] if is_home else data["awayTeam"]).get("id")
+        # team_id attribution fix (2026-10-03, Kris-approved): derive from the
+        # EVENT payload (same ids the matches table stores) + the trusted
+        # is_home side flag — never from the garbage player-level `teamId`
+        # (rootcause_teamid_20261002.md, team_attribution.py).
+        team_id = resolve_side_team_id(event, is_home)
         fallback_team = data["homeTeam"] if is_home else data["awayTeam"]
         for p in players:
             pl = p.get("player", {})

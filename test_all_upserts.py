@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 load_dotenv('.env')
 
 from curl_cffi import requests as cffi_requests
+from team_attribution import resolve_incident_team_id, resolve_side_team_id
 
 async def test_all():
     proxy = {'ip': '179.198.16.221', 'port': '6840', 'user': '***REMOVED***', 'pw': '***REMOVED***'}
@@ -99,7 +100,16 @@ async def test_all():
     if bundle.get("incidents", {}).get("incidents"):
         try:
             n = 0
+            rejected_foreign_team = 0
             for inc in bundle["incidents"]["incidents"]:
+                # team_id attribution fix (2026-10-03, Kris-approved): derive
+                # from the EVENT payload + isHome; skip + count foreign team
+                # ids (rootcause_teamid_20261002.md, team_attribution.py).
+                team_id, reject_reason = resolve_incident_team_id(inc, event_data)
+                if reject_reason == "foreign_team_id":
+                    rejected_foreign_team += 1
+                if team_id is None:
+                    continue
                 cur.execute("""
                     INSERT INTO match_incidents (match_id, incident_id, time, type, class, added_time,
                                                  home_score, away_score, player_id, player_name, team_id,
@@ -117,13 +127,15 @@ async def test_all():
                     inc.get("homeScore"), inc.get("awayScore"),
                     inc.get("player", {}).get("id"),
                     inc.get("player", {}).get("name"),
-                    inc.get("team", {}).get("id"),
+                    team_id,
                     1 if inc.get("isHome") else 0,
                     inc.get("text"), inc.get("inGameMinute")
                 ))
                 n += 1
             conn.commit()
             print("\u2705 incidents: %s rows" % n)
+            if rejected_foreign_team:
+                print("    [team_attribution] rejected %d foreign-team incident rows" % rejected_foreign_team)
         except Exception as e:
             print("\u274c incidents: %s" % e)
             conn.rollback()
@@ -140,12 +152,11 @@ async def test_all():
             for is_home, key in ((1, "home"), (0, "away")):
                 side = data.get(key, {}) or {}
                 team = side.get("team") or {}
-                team_id = team.get("id")
                 players = side.get("players", []) or []
-                if team_id is None and players:
-                    team_id = players[0].get("teamId")
-                if team_id is None:
-                    team_id = (data["homeTeam"] if is_home else data["awayTeam"]).get("id")
+                # team_id attribution fix (2026-10-03, Kris-approved): EVENT
+                # payload side id only — never the garbage player-level
+                # `teamId` (rootcause_teamid_20261002.md, team_attribution.py).
+                team_id = resolve_side_team_id(event_data, is_home)
                 fallback_team = data["homeTeam"] if is_home else data["awayTeam"]
                 for p in players:
                     pl = p.get("player", {})

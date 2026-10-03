@@ -33,6 +33,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
+from team_attribution import resolve_side_team_id
 from urllib.parse import urlparse
 
 
@@ -1694,23 +1695,16 @@ class DataInserter:
 
         for is_home, team_data in [(1, home), (0, away)]:
             # SofaScore lineups don't have a nested "team" object at the
-            # home/away level.  Derive team_id from the first player's
-            # teamId field, or from the injected homeTeam/awayTeam.
+            # home/away level, and player-level `teamId` is garbage.
             team = team_data.get("team", {})
-            team_id = team.get("id") if team else None
-
-            if team_id is None:
-                # Try player-level teamId (all players on same side share it)
-                players = team_data.get("players", [])
-                if players:
-                    team_id = players[0].get("teamId")
-
-            if team_id is None:
-                # Fallback to injected homeTeam/awayTeam from event_data
-                if is_home:
-                    team_id = data.get("homeTeam", {}).get("id")
-                else:
-                    team_id = data.get("awayTeam", {}).get("id")
+            # team_id attribution fix (2026-10-03, Kris-approved): derive from
+            # the injected homeTeam/awayTeam (the event payload — same ids the
+            # matches table stores) + the trusted is_home side flag — never
+            # from the garbage player-level `teamId`
+            # (rootcause_teamid_20261002.md, team_attribution.py).
+            # data["homeTeam"]/data["awayTeam"] are setdefault-injected from
+            # event_data by every caller (_upsert_endpoint / replay_bundle).
+            team_id = resolve_side_team_id(data, is_home)
 
             team_payload = team if team else (data.get("homeTeam", {}) if is_home else data.get("awayTeam", {}))
             if team_id:
